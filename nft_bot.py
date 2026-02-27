@@ -133,6 +133,19 @@ class NftAttrs:
         self.symbol_rarity    = ""
 
 
+def _set_attr(attrs: "NftAttrs", label: str, value: str, rarity: str) -> None:
+    """Устанавливает атрибут по метке."""
+    label = label.lower().strip()
+    if not value or value == "—":
+        return
+    if "model" in label and attrs.model == "—":
+        attrs.model, attrs.model_rarity = value, rarity
+    elif ("backdrop" in label or "background" in label) and attrs.backdrop == "—":
+        attrs.backdrop, attrs.backdrop_rarity = value, rarity
+    elif "symbol" in label and attrs.symbol == "—":
+        attrs.symbol, attrs.symbol_rarity = value, rarity
+
+
 async def fetch_nft_attrs(slug: str) -> NftAttrs:
     """
     Парсит атрибуты NFT прямо со страницы t.me/nft/{slug}
@@ -163,45 +176,74 @@ async def fetch_nft_attrs(slug: str) -> NftAttrs:
 
         soup = BeautifulSoup(html, "lxml")
 
-        # Telegram рендерит таблицу атрибутов в строках <tr>:
-        #   <td>Model</td>  <td>Queen Bee <span class="...rarity...">1%</span></td>
+        # ── Метод 1: ищем строки таблицы <tr><td>Label</td><td>Value</td></tr>
         for row in soup.select("tr"):
             cells = row.find_all("td")
             if len(cells) < 2:
                 continue
-
-            label = cells[0].get_text(strip=True).lower()
+            label      = cells[0].get_text(strip=True).lower()
             value_cell = cells[1]
-
-            # Вытаскиваем rarity из вложенного <span>
             rarity_span = value_cell.find("span")
             rarity = rarity_span.get_text(strip=True) if rarity_span else ""
             if rarity_span:
                 rarity_span.decompose()
             value = value_cell.get_text(strip=True)
+            _set_attr(attrs, label, value, rarity)
 
-            if "model" in label:
-                attrs.model, attrs.model_rarity = value, rarity
-            elif "backdrop" in label or "background" in label:
-                attrs.backdrop, attrs.backdrop_rarity = value, rarity
-            elif "symbol" in label:
-                attrs.symbol, attrs.symbol_rarity = value, rarity
+        # ── Метод 2: любые элементы с data-атрибутами trait/value
+        if attrs.model == "—":
+            for el in soup.find_all(attrs={"data-trait": True}):
+                label = str(el.get("data-trait", "")).lower()
+                value = str(el.get("data-value", el.get_text(strip=True)))
+                rarity = str(el.get("data-rarity", ""))
+                _set_attr(attrs, label, value, rarity)
 
-        # Fallback через og:description если таблицы нет
+        # ── Метод 3: ключ-значение через dl/dt/dd
+        if attrs.model == "—":
+            for dt in soup.find_all("dt"):
+                label = dt.get_text(strip=True).lower()
+                dd = dt.find_next_sibling("dd")
+                if dd:
+                    rarity_span = dd.find("span")
+                    rarity = rarity_span.get_text(strip=True) if rarity_span else ""
+                    if rarity_span:
+                        rarity_span.decompose()
+                    value = dd.get_text(strip=True)
+                    _set_attr(attrs, label, value, rarity)
+
+        # ── Метод 4: og:description — парсим строку вида
+        #   "Model: Queen Bee · Backdrop: Cappuccino · Symbol: Puffball"
+        #   ИЛИ с переносами строк вместо ·
         if attrs.model == "—":
             meta = soup.find("meta", attrs={"property": "og:description"})
             if meta:
-                for part in str(meta.get("content", "")).split("·"):
+                content = str(meta.get("content", ""))
+                logger.info("og:description content: %r", content)
+                # Делим по · или по \n
+                for sep in ("·", "\n", ","):
+                    if sep in content:
+                        parts = content.split(sep)
+                        break
+                else:
+                    parts = [content]
+                for part in parts:
                     part = part.strip()
                     if ":" in part:
                         k, _, v = part.partition(":")
-                        k, v = k.strip().lower(), v.strip()
-                        if "model" in k:
-                            attrs.model = v
-                        elif "backdrop" in k or "background" in k:
-                            attrs.backdrop = v
-                        elif "symbol" in k:
-                            attrs.symbol = v
+                        _set_attr(attrs, k.strip().lower(), v.strip(), "")
+
+        # ── Метод 5: ищем текст по ключевым словам в любых тегах
+        if attrs.model == "—":
+            full_text = soup.get_text(separator="\n")
+            logger.info("Full page text snippet: %r", full_text[:500])
+            for line in full_text.splitlines():
+                line = line.strip()
+                if ":" in line:
+                    k, _, v = line.partition(":")
+                    k = k.strip().lower()
+                    v = v.strip()
+                    if k in ("model", "backdrop", "background", "symbol") and v:
+                        _set_attr(attrs, k, v, "")
 
     except Exception as e:
         logger.warning("fetch_nft_attrs(%s): %s", slug, e)
@@ -258,12 +300,8 @@ async def safe_delete(msg: Message) -> None:
 # Custom emoji передаём через MessageEntity(type='custom_emoji').
 # Сначала строим plain-текст, потом список entities с offsets.
 
-def make_caption_with_entities(slug: str, attrs: NftAttrs, extra_line: str = ""):
-    """
-    Возвращает (text: str, entities: list[MessageEntity])
-    Custom emoji вставляются через entities, не через HTML.
-    Остальное форматирование — через HTML (bold, code, a).
-    """
+def make_caption_with_entities(slug: str, attrs: NftAttrs):
+    """Возвращает HTML-caption с атрибутами NFT."""
     name, number = split_slug(slug)
     nice_name    = readable_name(name)
 
@@ -282,8 +320,6 @@ def make_caption_with_entities(slug: str, attrs: NftAttrs, extra_line: str = "")
         f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
         f"🔗 <a href='https://t.me/nft/{slug}'>Открыть в Telegram</a>"
     )
-    if extra_line:
-        caption += f"\n\n<i>{extra_line}</i>"
 
     return caption
 
@@ -356,17 +392,15 @@ async def send_document_uncompressed(
     send_fn,
     webp_bytes: bytes,
     slug: str,
-    attrs: NftAttrs,
 ) -> None:
-    """Отправляет оригинал как документ (без сжатия)."""
-    file    = BufferedInputFile(webp_bytes, filename=f"{slug}.png")
-    caption = make_caption_with_entities(slug, attrs, extra_line="📎 Оригинальное качество — без сжатия")
+    """Отправляет оригинал как документ БЕЗ caption — просто файл."""
+    file = BufferedInputFile(webp_bytes, filename=f"{slug}.png")
     try:
-        await send_fn(document=file, caption=caption, parse_mode=ParseMode.HTML)
+        await send_fn(document=file)
     except TelegramRetryAfter as e:
         await asyncio.sleep(e.retry_after)
         file = BufferedInputFile(webp_bytes, filename=f"{slug}.png")
-        await send_fn(document=file, caption=caption, parse_mode=ParseMode.HTML)
+        await send_fn(document=file)
     except Exception as e:
         logger.error("send_document error: %s", e)
 
@@ -436,35 +470,30 @@ async def handle_text(message: Message) -> None:
     if png_data:
         success = await send_photo_with_keyboard(message, png_data, slug, attrs)
         if not success:
-            await send_document_uncompressed(message.answer_document, webp_data, slug, attrs)
+            await send_document_uncompressed(message.answer_document, webp_data, slug)
     else:
-        await send_document_uncompressed(message.answer_document, webp_data, slug, attrs)
+        await send_document_uncompressed(message.answer_document, webp_data, slug)
 
 
-# ── БАГ #4 ИСПРАВЛЕН: нет двойного callback.answer() ─────────────────────────
+# ── Кнопка «Отправить без сжатия» ────────────────────────────────────────────
 @dp.callback_query(F.data.startswith(CB_NO_COMPRESS))
 async def callback_no_compress(callback: CallbackQuery) -> None:
     slug = callback.data[len(CB_NO_COMPRESS):]
 
-    # Один и только один callback.answer() — закрывает "loading" на кнопке
     await callback.answer("⏳ Загружаю оригинал…", show_alert=False)
 
-    (found, webp_data, error), attrs = await asyncio.gather(
-        fetch_nft_image(slug),
-        fetch_nft_attrs(slug),
-    )
+    found, webp_data, error = await fetch_nft_image(slug)
 
-    # БАГ #4: раньше был второй callback.answer() — теперь ошибка идёт в message
     if error or not found:
         text = "❌ Не удалось загрузить файл" if error else "❌ Подарок не найден"
-        await callback.message.answer(text)   # ← message.answer, не callback.answer
+        await callback.message.answer(text)
         return
 
+    # Только файл — без caption
     await send_document_uncompressed(
         callback.message.answer_document,
         webp_data,
         slug,
-        attrs,
     )
 
 
