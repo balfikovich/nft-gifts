@@ -261,79 +261,113 @@ async def safe_delete(msg: Message) -> None:
         pass
 
 
-# ── Caption с custom emoji через entities ─────────────────────────────────────
-def make_caption(slug: str, attrs: NftAttrs) -> tuple[str, list[MessageEntity]]:
+# ── Caption с custom emoji через entities ────────────────────────────────────
+# В caption Telegram НЕ поддерживает <tg-emoji> HTML-тег.
+# Единственный способ — передавать caption_entities отдельно.
+# Строим plain-текст + список MessageEntity (custom_emoji, bold, text_link, code).
+
+def _utf16_len(s: str) -> int:
+    return len(s.encode("utf-16-le")) // 2
+
+def _utf16_offset(text_so_far: str) -> int:
+    return _utf16_len(text_so_far)
+
+def make_caption(slug: str, attrs: NftAttrs) -> tuple[str, list]:
     """
-    Возвращает (text, entities).
-    Custom emoji вставляются через MessageEntity — единственный рабочий способ
-    в caption, т.к. HTML-тег <tg-emoji> Telegram не поддерживает в caption.
+    Возвращает (plain_text, entities[]).
+    parse_mode НЕ передаётся — форматирование только через entities.
     """
     name, number = split_slug(slug)
-    nice_name    = readable_name(name)
+    nice = readable_name(name)
 
-    r_model    = f" {attrs.model_rarity}"    if attrs.model_rarity    else ""
-    r_backdrop = f" {attrs.backdrop_rarity}" if attrs.backdrop_rarity else ""
-    r_symbol   = f" {attrs.symbol_rarity}"   if attrs.symbol_rarity   else ""
-
-    # Строим plain text (без HTML) для подсчёта offset'ов entities
-    # Каждый custom emoji занимает ровно 1 символ-placeholder (мы используем сам эмодзи)
-    lines = [
-        ("🎁", E_GIFT,   f" {nice_name} #{number}\n"),
-        None,   # разделитель ━━━
-        ("🪄", E_MODEL,  f" Модель: {attrs.model}{r_model}\n"),
-        ("🎨", E_BACK,   f" Фон: {attrs.backdrop}{r_backdrop}\n"),
-        ("✨", E_SYMBOL, f" Символ: {attrs.symbol}{r_symbol}\n"),
-        None,   # разделитель ━━━
-        ("🔗", E_LINK,   f" Открыть в Telegram"),
-    ]
+    r_model = f" {attrs.model_rarity}"    if attrs.model_rarity    else ""
+    r_back  = f" {attrs.backdrop_rarity}" if attrs.backdrop_rarity else ""
+    r_sym   = f" {attrs.symbol_rarity}"   if attrs.symbol_rarity   else ""
 
     SEP = "━━━━━━━━━━━━━━━━━━━━\n"
-    text      = ""
-    entities: list[MessageEntity] = []
+    entities = []
+    t = ""  # накапливаем plain-text
 
-    for item in lines:
-        if item is None:
-            text += SEP
-            continue
-        emoji_char, emoji_id, rest = item
-        offset = len(text.encode("utf-16-le")) // 2   # Telegram считает offset в UTF-16
-        text += emoji_char
+    def add_custom_emoji(emoji_char: str, emoji_id: str):
+        nonlocal t
         entities.append(MessageEntity(
             type="custom_emoji",
-            offset=offset,
-            length=len(emoji_char),
+            offset=_utf16_offset(t),
+            length=_utf16_len(emoji_char),
             custom_emoji_id=emoji_id,
         ))
-        text += rest
+        t += emoji_char
 
-    # Последняя строка — ссылка, добавляем как text_link entity
-    link_text = "Открыть в Telegram"
-    link_start = text.rfind(link_text)
-    if link_start >= 0:
-        # пересчитываем offset в UTF-16 единицах
-        utf16_offset = len(text[:link_start].encode("utf-16-le")) // 2
+    def add_bold(s: str):
+        nonlocal t
+        entities.append(MessageEntity(
+            type="bold",
+            offset=_utf16_offset(t),
+            length=_utf16_len(s),
+        ))
+        t += s
+
+    def add_code(s: str):
+        nonlocal t
+        entities.append(MessageEntity(
+            type="code",
+            offset=_utf16_offset(t),
+            length=_utf16_len(s),
+        ))
+        t += s
+
+    def add_text_link(s: str, url: str):
+        nonlocal t
         entities.append(MessageEntity(
             type="text_link",
-            offset=utf16_offset,
-            length=len(link_text),
-            url=f"https://t.me/nft/{slug}",
+            offset=_utf16_offset(t),
+            length=_utf16_len(s),
+            url=url,
         ))
+        t += s
 
-    # Добавляем bold для названий атрибутов через HTML — проще оставить HTML для bold
-    # и не смешивать с entities. Используем HTML только для bold/code.
-    # Итого: возвращаем HTML-версию (без tg-emoji) + entities только для custom emoji
-    html = (
-        f"🎁 <b>{nice_name} #{number}</b>\n"
-        f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
-        f"🪄 <b>Модель:</b> {attrs.model}{r_model}\n"
-        f"🎨 <b>Фон:</b> {attrs.backdrop}{r_backdrop}\n"
-        f"✨ <b>Символ:</b> {attrs.symbol}{r_symbol}\n"
-        f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
-        f"🔗 <a href='https://t.me/nft/{slug}'>Открыть в Telegram</a>\n"
-        f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
-        f"<i>Создано: {AUTHOR}</i>"
-    )
-    return html
+    def plain(s: str):
+        nonlocal t
+        t += s
+
+    # ── Строка 1: 🎁 Neko Helmet #2279 ──
+    add_custom_emoji("🎁", E_GIFT)
+    plain(" ")
+    add_bold(f"{nice} #{number}")
+    plain("\n")
+
+    # ── Разделитель ──
+    add_code(SEP.rstrip("\n"))
+    plain("\n")
+
+    # ── 🪄 Модель ──
+    add_custom_emoji("🪄", E_MODEL)
+    plain(" ")
+    add_bold("Модель:")
+    plain(f" {attrs.model}{r_model}\n")
+
+    # ── 🎨 Фон ──
+    add_custom_emoji("🎨", E_BACK)
+    plain(" ")
+    add_bold("Фон:")
+    plain(f" {attrs.backdrop}{r_back}\n")
+
+    # ── ✨ Символ ──
+    add_custom_emoji("✨", E_SYMBOL)
+    plain(" ")
+    add_bold("Символ:")
+    plain(f" {attrs.symbol}{r_sym}\n")
+
+    # ── Разделитель ──
+    add_code(SEP.rstrip("\n"))
+    plain("\n")
+
+    # ── 🔗 Ссылка ──
+    add_custom_emoji("🔗", E_LINK)
+    plain(" ")
+    add_text_link("Открыть в Telegram", f"https://t.me/nft/{slug}")
+
+    return t, entities
 
 
 def make_keyboard(slug: str) -> InlineKeyboardMarkup:
@@ -352,14 +386,14 @@ async def send_photo_with_keyboard(
     slug: str,
     attrs: NftAttrs,
 ) -> bool:
-    file    = BufferedInputFile(png_bytes, filename=f"{slug}.png")
-    caption = make_caption(slug, attrs)
-    kbd     = make_keyboard(slug)
+    file          = BufferedInputFile(png_bytes, filename=f"{slug}.png")
+    caption, ents = make_caption(slug, attrs)
+    kbd           = make_keyboard(slug)
     try:
         await message.answer_photo(
             photo=file,
             caption=caption,
-            parse_mode=ParseMode.HTML,
+            caption_entities=ents,
             reply_markup=kbd,
         )
         return True
@@ -368,8 +402,10 @@ async def send_photo_with_keyboard(
         try:
             file = BufferedInputFile(png_bytes, filename=f"{slug}.png")
             await message.answer_photo(
-                photo=file, caption=caption,
-                parse_mode=ParseMode.HTML, reply_markup=kbd,
+                photo=file,
+                caption=caption,
+                caption_entities=ents,
+                reply_markup=kbd,
             )
             return True
         except Exception as e2:
@@ -470,8 +506,7 @@ async def handle_text(message: Message) -> None:
             f"<b>Возможные причины:</b>\n"
             f"• Номер ещё не существует\n"
             f"• Подарок был сожжён 🔥\n"
-            f"• Опечатка в ссылке\n\n"
-            f"<i>Автор: <a href='https://t.me/balfikovich'>{AUTHOR}</a></i>",
+            f"• Опечатка в ссылке",
             parse_mode=ParseMode.HTML,
         )
         return
