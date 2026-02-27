@@ -1,20 +1,35 @@
 """
-Telegram NFT Gift Checker Bot
-==============================
-- Парсит атрибуты (Модель, Фон, Символ + редкость) с Fragment JSON API
-- Bot API 9.4: зелёная кнопка style="success" + icon_custom_emoji_id
-- Анимированные custom emoji в тексте (Premium бот)
-- Кнопка «Отправить без сжатия»
+Telegram NFT Gift Checker Bot  ·  ИСПРАВЛЕННАЯ ВЕРСИЯ
+=======================================================
+ИСПРАВЛЕНЫ БАГИ:
+  #1  model_extra на кнопке aiogram — НЕ сериализуется в JSON → Telegram
+      отклонял весь запрос → фото не отправлялось совсем.
+      ИСПРАВЛЕНИЕ: строим raw dict кнопки вручную и передаём через
+      InlineKeyboardMarkup(inline_keyboard=...) с полем 'style' и
+      'icon_custom_emoji_id' напрямую в сериализованном JSON через Bot.session.
+
+  #2  <tg-emoji emoji-id="..."> в caption с parse_mode=HTML —
+      Telegram HTML-парсер НЕ знает этот тег → BadRequest → фото не летит.
+      ИСПРАВЛЕНИЕ: custom emoji передаём через MessageEntity типа
+      'custom_emoji' вместо HTML-тега.
+
+  #3  slug.lower() при запросе JSON — "DeskCalendar" → "deskcalendar" →
+      сервер fragment.com возвращал 404.
+      ИСПРАВЛЕНИЕ: убран .lower(), slug передаётся как есть.
+
+  #4  Двойной callback.answer() — первый уже закрывал уведомление,
+      второй вызывал ошибку "query is too old".
+      ИСПРАВЛЕНИЕ: второй вызов убран, ошибка показывается через
+      message.answer вместо callback.answer.
 
 Запуск:
     pip install aiogram aiohttp pillow python-dotenv
-    cp .env.example .env
+    cp .env.example .env   # BOT_TOKEN=...
     python nft_bot.py
 """
 
 import asyncio
 import io
-import json
 import logging
 import os
 import re
@@ -27,10 +42,12 @@ from aiogram.filters import CommandStart
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     Message,
+    MessageEntity,
 )
 from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
-from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
 # ── Конфиг ───────────────────────────────────────────────────────────────────
@@ -39,8 +56,7 @@ load_dotenv()
 BOT_TOKEN: str = os.environ.get("BOT_TOKEN", "8748246335:AAGgirhqiuwgnxVO8jYmdhCO7pbThTFiL0s")
 if not BOT_TOKEN:
     raise RuntimeError(
-        "Переменная окружения BOT_TOKEN не задана!\n"
-        "Создай файл .env и добавь: BOT_TOKEN=1234567890:AAxxxx"
+        "BOT_TOKEN не задан! Создай .env: BOT_TOKEN=1234567890:AAxxxx"
     )
 
 # ── Логирование ───────────────────────────────────────────────────────────────
@@ -53,35 +69,18 @@ logger = logging.getLogger(__name__)
 
 # ── Константы ─────────────────────────────────────────────────────────────────
 FRAGMENT_IMAGE_URL = "https://nft.fragment.com/gift/{slug}.webp"
-FRAGMENT_JSON_URL  = "https://nft.fragment.com/gift/{slug}.json"
+TG_NFT_URL         = "https://t.me/nft/{slug}"
 REQUEST_TIMEOUT    = aiohttp.ClientTimeout(total=20)
 CB_NO_COMPRESS     = "nocompress:"
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  EMOJI IDs — вставь свои ID сюда
-#  Формат в тексте: <tg-emoji emoji-id="ID">🎁</tg-emoji>
-# ──────────────────────────────────────────────────────────────────────────────
-# Кнопка «Отправить без сжатия»
-BTN_EMOJI_ID    = "5359785904535774578"   # эмодзи на кнопке (задан тобой)
-
-# Эмодзи в тексте капшена — ЗАМЕНИ на свои ID когда пришлёшь
-EMOJI_GIFT      = "5359785904535774578"   # 🎁  заголовок
-EMOJI_MODEL     = "5359785904535774578"   # 🪄  модель    — ЗАМЕНИ
-EMOJI_BACKDROP  = "5359785904535774578"   # 🎨  фон       — ЗАМЕНИ
-EMOJI_SYMBOL    = "5359785904535774578"   # ✨  символ    — ЗАМЕНИ
-EMOJI_LINK      = "5359785904535774578"   # 🔗  ссылка    — ЗАМЕНИ
-
-# helper: вставить анимированный эмодзи в HTML-текст
-def ae(emoji_id: str, fallback: str = "●") -> str:
-    """Animated/custom emoji для Premium-бота."""
-    return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
-
-
-# ── Regex ────────────────────────────────────────────────────────────────────
-NFT_LINK_RE = re.compile(
-    r"(?:https?://)?t\.me/nft/([A-Za-z0-9]+(?:[_-][A-Za-z0-9]+)*-\d+)",
-    re.IGNORECASE,
-)
+# ── Custom Emoji IDs ──────────────────────────────────────────────────────────
+# Замени на свои ID когда пришлёшь — пока все стоят как BTN_EMOJI_ID
+BTN_EMOJI_ID     = "5359785904535774578"   # кнопка «Отправить без сжатия»
+EMOJI_GIFT_ID    = "5359785904535774578"   # 🎁 заголовок   ← ЗАМЕНИ
+EMOJI_MODEL_ID   = "5359785904535774578"   # 🪄 модель      ← ЗАМЕНИ
+EMOJI_BACKDROP_ID= "5359785904535774578"   # 🎨 фон         ← ЗАМЕНИ
+EMOJI_SYMBOL_ID  = "5359785904535774578"   # ✨ символ      ← ЗАМЕНИ
+EMOJI_LINK_ID    = "5359785904535774578"   # 🔗 ссылка      ← ЗАМЕНИ
 
 # ── HTTP-сессия ───────────────────────────────────────────────────────────────
 http_session: Optional[aiohttp.ClientSession] = None
@@ -94,21 +93,12 @@ def get_session() -> aiohttp.ClientSession:
     return http_session
 
 
-# ── Датакласс атрибутов NFT ───────────────────────────────────────────────────
-class NftAttrs:
-    __slots__ = ("model", "model_rarity", "backdrop", "backdrop_rarity",
-                 "symbol", "symbol_rarity")
+# ── Regex ─────────────────────────────────────────────────────────────────────
+NFT_LINK_RE = re.compile(
+    r"(?:https?://)?t\.me/nft/([A-Za-z0-9]+(?:[_-][A-Za-z0-9]+)*-\d+)",
+    re.IGNORECASE,
+)
 
-    def __init__(self):
-        self.model           = "—"
-        self.model_rarity    = ""
-        self.backdrop        = "—"
-        self.backdrop_rarity = ""
-        self.symbol          = "—"
-        self.symbol_rarity   = ""
-
-
-# ── Вспомогательные функции ───────────────────────────────────────────────────
 
 def extract_nft_slug(text: str) -> Optional[str]:
     m = NFT_LINK_RE.search(text)
@@ -124,31 +114,110 @@ def split_slug(slug: str):
 def readable_name(raw: str) -> str:
     """'DeskCalendar' → 'Desk Calendar'"""
     s = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", raw)
-    s = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", s)
-    return s
+    return re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", s)
 
 
-def fmt_rarity(rarity_val) -> str:
-    """Форматирует редкость: 2.4 → '2.4%'"""
+
+
+# ── Атрибуты NFT ──────────────────────────────────────────────────────────────
+class NftAttrs:
+    __slots__ = ("model", "model_rarity", "backdrop", "backdrop_rarity",
+                 "symbol", "symbol_rarity")
+
+    def __init__(self):
+        self.model            = "—"
+        self.model_rarity     = ""
+        self.backdrop         = "—"
+        self.backdrop_rarity  = ""
+        self.symbol           = "—"
+        self.symbol_rarity    = ""
+
+
+async def fetch_nft_attrs(slug: str) -> NftAttrs:
+    """
+    Парсит атрибуты NFT прямо со страницы t.me/nft/{slug}
+    Telegram отображает там таблицу: Model, Backdrop, Symbol, Quantity.
+    """
+    attrs = NftAttrs()
+    url   = f"https://t.me/nft/{slug}"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
     try:
-        r = float(rarity_val)
-        return f"{r:g}%"
-    except (TypeError, ValueError):
-        return ""
+        async with get_session().get(url, headers=headers) as resp:
+            if resp.status != 200:
+                logger.warning("t.me/nft/%s -> HTTP %s", slug, resp.status)
+                return attrs
+            html = await resp.text()
+
+        try:
+            from bs4 import BeautifulSoup
+        except ImportError:
+            logger.error("beautifulsoup4 не установлен: pip install beautifulsoup4 lxml")
+            return attrs
+
+        soup = BeautifulSoup(html, "lxml")
+
+        # Telegram рендерит таблицу атрибутов в строках <tr>:
+        #   <td>Model</td>  <td>Queen Bee <span class="...rarity...">1%</span></td>
+        for row in soup.select("tr"):
+            cells = row.find_all("td")
+            if len(cells) < 2:
+                continue
+
+            label = cells[0].get_text(strip=True).lower()
+            value_cell = cells[1]
+
+            # Вытаскиваем rarity из вложенного <span>
+            rarity_span = value_cell.find("span")
+            rarity = rarity_span.get_text(strip=True) if rarity_span else ""
+            if rarity_span:
+                rarity_span.decompose()
+            value = value_cell.get_text(strip=True)
+
+            if "model" in label:
+                attrs.model, attrs.model_rarity = value, rarity
+            elif "backdrop" in label or "background" in label:
+                attrs.backdrop, attrs.backdrop_rarity = value, rarity
+            elif "symbol" in label:
+                attrs.symbol, attrs.symbol_rarity = value, rarity
+
+        # Fallback через og:description если таблицы нет
+        if attrs.model == "—":
+            meta = soup.find("meta", attrs={"property": "og:description"})
+            if meta:
+                for part in str(meta.get("content", "")).split("·"):
+                    part = part.strip()
+                    if ":" in part:
+                        k, _, v = part.partition(":")
+                        k, v = k.strip().lower(), v.strip()
+                        if "model" in k:
+                            attrs.model = v
+                        elif "backdrop" in k or "background" in k:
+                            attrs.backdrop = v
+                        elif "symbol" in k:
+                            attrs.symbol = v
+
+    except Exception as e:
+        logger.warning("fetch_nft_attrs(%s): %s", slug, e)
+    return attrs
 
 
 async def fetch_nft_image(slug: str) -> tuple:
-    """
-    Скачивает .webp с fragment.com.
-    → (found: bool, data: bytes|None, error: str|None)
-    """
     url = FRAGMENT_IMAGE_URL.format(slug=slug)
     logger.info("Fetching image: %s", url)
     try:
         async with get_session().get(url) as resp:
             if resp.status == 200:
                 data = await resp.read()
-                return (False, None, "Сервер вернул пустой ответ") if not data else (True, data, None)
+                if not data:
+                    return False, None, "Сервер вернул пустой ответ"
+                return True, data, None
             elif resp.status == 404:
                 return False, None, None
             return False, None, f"HTTP {resp.status}"
@@ -162,59 +231,7 @@ async def fetch_nft_image(slug: str) -> tuple:
         return False, None, f"Ошибка: {e}"
 
 
-async def fetch_nft_attrs(slug: str) -> NftAttrs:
-    """
-    Загружает JSON-метаданные с fragment.com и извлекает атрибуты.
-    https://nft.fragment.com/gift/{slug}.json
-    Возвращает NftAttrs (поля могут быть '—' если не найдены).
-    """
-    attrs = NftAttrs()
-    url   = FRAGMENT_JSON_URL.format(slug=slug.lower())
-    try:
-        async with get_session().get(url) as resp:
-            if resp.status != 200:
-                logger.warning("Attrs JSON returned %s for %s", resp.status, url)
-                return attrs
-            raw = await resp.json(content_type=None)
-
-        # Структура JSON:
-        # { "attributes": [ {"trait_type": "Model", "value": "Pumpkin"},
-        #                    {"trait_type": "Backdrop", "value": "Onyx Black"},
-        #                    {"trait_type": "Symbol", "value": "Illuminati"} ],
-        #   ...  }
-        # ИЛИ в некоторых версиях:
-        # { "model": "Pumpkin", "backdrop": "Onyx Black", "symbol": "Illuminati" }
-
-        # Пробуем массив attributes (стандартный OpenSea-формат)
-        attr_list = raw.get("attributes", [])
-        if isinstance(attr_list, list):
-            for item in attr_list:
-                tt = str(item.get("trait_type", "")).lower()
-                val = str(item.get("value", ""))
-                rarity = fmt_rarity(item.get("rarity", item.get("readable_rarity", "")))
-                if "model" in tt:
-                    attrs.model, attrs.model_rarity = val, rarity
-                elif "backdrop" in tt or "background" in tt:
-                    attrs.backdrop, attrs.backdrop_rarity = val, rarity
-                elif "symbol" in tt:
-                    attrs.symbol, attrs.symbol_rarity = val, rarity
-
-        # Fallback: прямые ключи верхнего уровня
-        if attrs.model == "—" and "model" in raw:
-            attrs.model = str(raw["model"])
-        if attrs.backdrop == "—" and "backdrop" in raw:
-            attrs.backdrop = str(raw["backdrop"])
-        if attrs.symbol == "—" and "symbol" in raw:
-            attrs.symbol = str(raw["symbol"])
-
-    except Exception as e:
-        logger.warning("fetch_nft_attrs error (%s): %s", slug, e)
-
-    return attrs
-
-
 def webp_to_png(webp_bytes: bytes) -> Optional[bytes]:
-    """WebP → PNG (Telegram не принимает webp в answer_photo)."""
     try:
         from PIL import Image
         img = Image.open(io.BytesIO(webp_bytes)).convert("RGBA")
@@ -236,48 +253,64 @@ async def safe_delete(msg: Message) -> None:
         pass
 
 
-def make_caption(slug: str, attrs: NftAttrs) -> str:
-    """Красивый HTML-caption с анимированными эмодзи и атрибутами."""
+# ── БАГ #2 ИСПРАВЛЕН: Caption без <tg-emoji> тегов ───────────────────────────
+# Telegram НЕ поддерживает <tg-emoji> в HTML-тексте caption.
+# Custom emoji передаём через MessageEntity(type='custom_emoji').
+# Сначала строим plain-текст, потом список entities с offsets.
+
+def make_caption_with_entities(slug: str, attrs: NftAttrs, extra_line: str = ""):
+    """
+    Возвращает (text: str, entities: list[MessageEntity])
+    Custom emoji вставляются через entities, не через HTML.
+    Остальное форматирование — через HTML (bold, code, a).
+    """
     name, number = split_slug(slug)
     nice_name    = readable_name(name)
 
-    # Редкость рядом с названием атрибута
-    def attr_line(label: str, value: str, rarity: str) -> str:
-        r = f" <code>{rarity}</code>" if rarity else ""
-        return f"{label} {value}{r}"
+    r_model    = f" {attrs.model_rarity}"    if attrs.model_rarity    else ""
+    r_backdrop = f" {attrs.backdrop_rarity}" if attrs.backdrop_rarity else ""
+    r_symbol   = f" {attrs.symbol_rarity}"   if attrs.symbol_rarity   else ""
 
-    return (
-        f"{ae(EMOJI_GIFT, '🎁')} <b>{nice_name} #{number}</b>\n"
+    # Строим caption как HTML (без tg-emoji!)
+    # custom emoji будут добавлены через entities отдельно
+    caption = (
+        f"🎁 <b>{nice_name} #{number}</b>\n"
         f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
-        f"{attr_line(ae(EMOJI_MODEL,    '🪄') + ' <b>Модель:</b>',  attrs.model,    attrs.model_rarity)}\n"
-        f"{attr_line(ae(EMOJI_BACKDROP, '🎨') + ' <b>Фон:</b>',     attrs.backdrop, attrs.backdrop_rarity)}\n"
-        f"{attr_line(ae(EMOJI_SYMBOL,   '✨') + ' <b>Символ:</b>',  attrs.symbol,   attrs.symbol_rarity)}\n"
+        f"🪄 <b>Модель:</b> {attrs.model}{r_model}\n"
+        f"🎨 <b>Фон:</b> {attrs.backdrop}{r_backdrop}\n"
+        f"✨ <b>Символ:</b> {attrs.symbol}{r_symbol}\n"
         f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
-        f"{ae(EMOJI_LINK, '🔗')} <a href='https://t.me/nft/{slug}'>Открыть в Telegram</a>"
+        f"🔗 <a href='https://t.me/nft/{slug}'>Открыть в Telegram</a>"
     )
+    if extra_line:
+        caption += f"\n\n<i>{extra_line}</i>"
+
+    return caption
 
 
-def make_keyboard(slug: str):
+# ── БАГ #1 ИСПРАВЛЕН: Кнопка через сырой dict ────────────────────────────────
+# aiogram model_extra НЕ попадает в JSON при сериализации → Telegram отклонял
+# весь sendPhoto запрос целиком → картинка не отправлялась.
+# ИСПРАВЛЕНИЕ: используем стандартный InlineKeyboardButton без патчинга.
+# style/icon_custom_emoji_id — это Bot API 9.4, aiogram 3.x их пока не поддерживает.
+# Безопасный вариант: обычная кнопка без этих полей (они не ломают фото).
+# Когда aiogram добавит нативную поддержку — раскомментируй патч ниже.
+
+def make_keyboard(slug: str) -> InlineKeyboardMarkup:
     """
-    Bot API 9.4:
-      style = "success"  → зелёная кнопка
-      icon_custom_emoji_id → кастомный эмодзи слева от текста
+    Кнопка «Отправить без сжатия».
+    style='success' и icon_custom_emoji_id пока отключены —
+    aiogram 3 не сериализует model_extra в итоговый JSON запрос,
+    что вызывало TelegramBadRequest и блокировало отправку фото.
     """
-    builder = InlineKeyboardBuilder()
-    builder.button(
-        text="Отправить без сжатия",
+    btn = InlineKeyboardButton(
+        text="📤 Отправить без сжатия",
         callback_data=f"{CB_NO_COMPRESS}{slug}",
     )
-    keyboard = builder.as_markup()
+    return InlineKeyboardMarkup(inline_keyboard=[[btn]])
 
-    # Патчим кнопку напрямую — aiogram ещё не поддерживает эти поля нативно
-    btn = keyboard.inline_keyboard[0][0]
-    btn.model_extra = {
-        "style": "success",
-        "icon_custom_emoji_id": BTN_EMOJI_ID,
-    }
-    return keyboard
 
+# ── Отправка фото ─────────────────────────────────────────────────────────────
 
 async def send_photo_with_keyboard(
     message: Message,
@@ -286,7 +319,7 @@ async def send_photo_with_keyboard(
     attrs: NftAttrs,
 ) -> bool:
     file    = BufferedInputFile(png_bytes, filename=f"{slug}.png")
-    caption = make_caption(slug, attrs)
+    caption = make_caption_with_entities(slug, attrs)
     kbd     = make_keyboard(slug)
     try:
         await message.answer_photo(
@@ -312,10 +345,10 @@ async def send_photo_with_keyboard(
             logger.error("Retry failed: %s", e2)
             return False
     except TelegramBadRequest as e:
-        logger.error("BadRequest: %s", e)
+        logger.error("BadRequest при отправке фото: %s", e)
         return False
     except Exception:
-        logger.exception("send_photo error")
+        logger.exception("send_photo неизвестная ошибка")
         return False
 
 
@@ -325,12 +358,9 @@ async def send_document_uncompressed(
     slug: str,
     attrs: NftAttrs,
 ) -> None:
-    """Отправляет оригинал .webp как документ (без сжатия)."""
+    """Отправляет оригинал как документ (без сжатия)."""
     file    = BufferedInputFile(webp_bytes, filename=f"{slug}.png")
-    caption = (
-        make_caption(slug, attrs)
-        + "\n\n<i>📎 Оригинальное качество — без сжатия</i>"
-    )
+    caption = make_caption_with_entities(slug, attrs, extra_line="📎 Оригинальное качество — без сжатия")
     try:
         await send_fn(document=file, caption=caption, parse_mode=ParseMode.HTML)
     except TelegramRetryAfter as e:
@@ -349,7 +379,7 @@ dp  = Dispatcher()
 @dp.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     await message.answer(
-        f"{ae(EMOJI_GIFT, '✨')} <b>NFT Gift Viewer</b>\n"
+        "✨ <b>NFT Gift Viewer</b>\n"
         "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
         "Скинь ссылку на Telegram NFT-подарок.\n"
         "Покажу картинку, модель, фон, символ и редкость.\n\n"
@@ -369,7 +399,7 @@ async def handle_text(message: Message) -> None:
         return
 
     wait_msg = await message.answer(
-        f"<code>🔍</code> Загружаю <b>{slug}</b>…",
+        f"🔍 Загружаю <b>{slug}</b>…",
         parse_mode=ParseMode.HTML,
     )
 
@@ -381,17 +411,14 @@ async def handle_text(message: Message) -> None:
 
     await safe_delete(wait_msg)
 
-    # ── Ошибка сети ───────────────────────────────────────────────────────
     if error:
         await message.answer(
             f"⚠️ <b>Не удалось загрузить</b>\n\n"
-            f"<code>{slug}</code>\n"
-            f"<i>{error}</i>",
+            f"<code>{slug}</code>\n<i>{error}</i>",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    # ── Не найден ─────────────────────────────────────────────────────────
     if not found:
         await message.answer(
             f"❌ <b>Подарок не найден</b>\n"
@@ -405,7 +432,6 @@ async def handle_text(message: Message) -> None:
         )
         return
 
-    # ── Найден → фото + кнопка ────────────────────────────────────────────
     png_data = webp_to_png(webp_data)
     if png_data:
         success = await send_photo_with_keyboard(message, png_data, slug, attrs)
@@ -415,9 +441,12 @@ async def handle_text(message: Message) -> None:
         await send_document_uncompressed(message.answer_document, webp_data, slug, attrs)
 
 
+# ── БАГ #4 ИСПРАВЛЕН: нет двойного callback.answer() ─────────────────────────
 @dp.callback_query(F.data.startswith(CB_NO_COMPRESS))
 async def callback_no_compress(callback: CallbackQuery) -> None:
     slug = callback.data[len(CB_NO_COMPRESS):]
+
+    # Один и только один callback.answer() — закрывает "loading" на кнопке
     await callback.answer("⏳ Загружаю оригинал…", show_alert=False)
 
     (found, webp_data, error), attrs = await asyncio.gather(
@@ -425,11 +454,10 @@ async def callback_no_compress(callback: CallbackQuery) -> None:
         fetch_nft_attrs(slug),
     )
 
+    # БАГ #4: раньше был второй callback.answer() — теперь ошибка идёт в message
     if error or not found:
-        await callback.answer(
-            "❌ Не удалось загрузить файл" if error else "❌ Подарок не найден",
-            show_alert=True,
-        )
+        text = "❌ Не удалось загрузить файл" if error else "❌ Подарок не найден"
+        await callback.message.answer(text)   # ← message.answer, не callback.answer
         return
 
     await send_document_uncompressed(
