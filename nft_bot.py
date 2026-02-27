@@ -28,7 +28,7 @@ from dotenv import load_dotenv
 # ── Загрузка конфига ────────────────────────────────────────────────────────
 load_dotenv()  # читает файл .env если есть
 
-BOT_TOKEN: str = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN: str = os.environ.get("BOT_TOKEN", "8748246335:AAGgirhqiuwgnxVO8jYmdhCO7pbThTFiL0s")
 if not BOT_TOKEN:
     raise RuntimeError(
         "Переменная окружения BOT_TOKEN не задана!\n"
