@@ -10,25 +10,21 @@ from typing import Optional
 import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode, ChatMemberStatus
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
     ChatMemberUpdated,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    LabeledPrice,
     Message,
     MessageEntity,
     InlineQuery,
     InlineQueryResultArticle,
     InlineQueryResultPhoto,
     InputTextMessageContent,
-)
-from aiogram.filters.chat_member_updated import (
-    ChatMemberUpdatedFilter,
-    IS_NOT_MEMBER,
-    IS_MEMBER,
-    IS_ADMIN,
+    PreCheckoutQuery,
 )
 from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest, TelegramForbiddenError
 from dotenv import load_dotenv
@@ -40,12 +36,11 @@ BOT_TOKEN: str = os.environ.get("BOT_TOKEN", "8748246335:AAGgirhqiuwgnxVO8jYmdhC
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не задан! Создай .env: BOT_TOKEN=xxx")
 
+# ── ID администратора — сюда приходят уведомления о донатах ──────────────────
+ADMIN_ID = 5479063264
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  ЛОГИРОВАНИЕ
-#  - Консоль: всё что происходит, читаемо
-#  - Файл bot.log: то же самое, хранится на диске
-#  - logger      → технические ошибки (HTTP, PIL, и т.д.)
-#  - user_log    → действия пользователей (кто что запросил)
 # ══════════════════════════════════════════════════════════════════════════════
 
 LOG_FILE = os.environ.get("LOG_FILE", "bot.log")
@@ -54,10 +49,8 @@ _fmt = logging.Formatter(
     fmt="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-
 _console_handler = logging.StreamHandler()
 _console_handler.setFormatter(_fmt)
-
 _file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
 _file_handler.setFormatter(_fmt)
 
@@ -72,7 +65,7 @@ def _u(user) -> str:
     if user is None:
         return "unknown"
     name  = (user.full_name or "").strip() or "NoName"
-    uname = f" @{user.username}" if user.username else ""
+    uname = f" @{user.username}" if user.username else " (без username)"
     return f"{name}{uname} (id={user.id})"
 
 
@@ -80,11 +73,9 @@ def _chat(chat) -> str:
     """Название + тип + id чата."""
     if chat is None:
         return "unknown"
-    title = (
-        getattr(chat, "title", None)
-        or getattr(chat, "full_name", None)
-        or "NoTitle"
-    ).strip()
+    if chat.type == "private":
+        return f"личка [{chat.type}] (id={chat.id})"
+    title = (getattr(chat, "title", None) or "NoTitle").strip()
     return f'"{title}" [{chat.type}] (id={chat.id})'
 
 
@@ -92,6 +83,7 @@ def _chat(chat) -> str:
 FRAGMENT_IMAGE_URL = "https://nft.fragment.com/gift/{slug}.webp"
 REQUEST_TIMEOUT    = aiohttp.ClientTimeout(total=20)
 CB_NO_COMPRESS     = "nocompress:"
+CB_DONATE          = "donate_start"
 AUTHOR             = "@balfikovich"
 ANTISPAM_SECONDS   = 1.5
 ANTISPAM_SLUG_SEC  = 300
@@ -105,6 +97,7 @@ E_LINK   = "5409143419593321597"
 E_WARN   = "5409124594751660992"
 E_ERR    = "5408930028438188841"
 E_START  = "6028495398941759268"
+E_DONATE = "5309759985192832914"
 
 # ── Антиспам ──────────────────────────────────────────────────────────────────
 _last_request: dict[int, float] = {}
@@ -112,18 +105,20 @@ _last_slug: dict[str, float]    = {}
 _cb_lock: dict[int, bool]       = {}
 _used_no_compress: set[str]     = set()   # "message_id:slug"
 
+# ── Состояние ожидания суммы доната ──────────────────────────────────────────
+_awaiting_donate_amount: set[int] = set()
+
 # ── Имя бота ─────────────────────────────────────────────────────────────────
 BOT_USERNAME: str = ""
 
 
 def check_antispam(user_id: int) -> float:
-    """Возвращает 0 если можно пропустить, иначе — сколько ждать."""
+    """Возвращает 0 если запрос пропускается, иначе — сколько секунд ждать."""
     now  = time.monotonic()
     last = _last_request.get(user_id, 0.0)
     diff = now - last
     if diff < ANTISPAM_SECONDS:
         return round(ANTISPAM_SECONDS - diff, 1)
-    # Обновляем время только когда пропускаем запрос
     _last_request[user_id] = now
     return 0.0
 
@@ -518,13 +513,13 @@ async def send_photo_with_keyboard(
             )
             return True
         except Exception as ex:
-            logger.error("send_photo | retry failed | error=%s", ex)
+            logger.error("Retry send_photo failed: %s", ex)
             return False
     except TelegramBadRequest as e:
-        logger.error("send_photo | BadRequest | error=%s", e)
+        logger.error("BadRequest send_photo: %s", e)
         return False
     except Exception:
-        logger.exception("send_photo | unexpected error")
+        logger.exception("send_photo error")
         return False
 
 
@@ -537,7 +532,7 @@ async def send_document_only(send_fn, webp_bytes: bytes, slug: str) -> None:
         file = BufferedInputFile(webp_bytes, filename=f"{slug}.png")
         await send_fn(document=file)
     except Exception as e:
-        logger.error("send_document | error=%s", e)
+        logger.error("send_document error: %s", e)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -548,9 +543,9 @@ bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
 
 
-# ── Бот добавлен / удалён из группы ──────────────────────────────────────────
+# ── Бот добавлен / удалён из группы ─────────────────────────────────────────
 @dp.my_chat_member()
-async def on_bot_status_changed(event: ChatMemberUpdated) -> None:
+async def on_bot_added_to_group(event: ChatMemberUpdated) -> None:
     if event.chat.type not in ("group", "supergroup"):
         return
 
@@ -565,8 +560,12 @@ async def on_bot_status_changed(event: ChatMemberUpdated) -> None:
     chat = _chat(event.chat)
 
     if was_outside and now_inside:
-        role = "администратором" if new_status in (ChatMemberStatus.ADMINISTRATOR, "administrator") else "участником"
-        user_log.info("➕ БОТ ДОБАВЛЕН В ГРУППУ | кто=%s | чат=%s | роль=%s", who, chat, role)
+        role    = "администратором" if new_status in (ChatMemberStatus.ADMINISTRATOR, "administrator") else "участником"
+        privacy = "приватный" if getattr(event.chat, "username", None) is None else "публичный"
+        user_log.info(
+            "➕ БОТ ДОБАВЛЕН В ГРУППУ | кто=%s | чат=%s | роль=%s | тип_чата=%s",
+            who, chat, role, privacy,
+        )
         chat_title = event.chat.title or "этот чат"
         try:
             await bot.send_message(
@@ -591,7 +590,7 @@ async def cmd_start(message: Message) -> None:
     if message.chat.type != "private":
         return
 
-    user_log.info("▶ /start | пользователь=%s", _u(message.from_user))
+    user_log.info("▶  /start | пользователь=%s", _u(message.from_user))
 
     buttons = []
     if BOT_USERNAME:
@@ -601,25 +600,184 @@ async def cmd_start(message: Message) -> None:
                 url=f"https://t.me/{BOT_USERNAME}?startgroup",
             )
         ])
+    buttons.append([
+        InlineKeyboardButton(
+            text="⭐ Поддержать автора",
+            callback_data=CB_DONATE,
+        )
+    ])
 
-    reply_markup = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
     await message.answer(
         get_start_text(),
         parse_mode=ParseMode.HTML,
-        reply_markup=reply_markup,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
+
+
+# ── /cancel_donate — отмена ожидания суммы ───────────────────────────────────
+@dp.message(Command("cancel_donate"))
+async def cmd_cancel_donate(message: Message) -> None:
+    if message.chat.type != "private":
+        return
+    user_id = message.from_user.id
+    if user_id in _awaiting_donate_amount:
+        _awaiting_donate_amount.discard(user_id)
+        user_log.info("❌ ДОНАТ ОТМЕНЁН | пользователь=%s", _u(message.from_user))
+        await message.answer(
+            "✅ Окей, донат отменён. Если передумаешь — всегда возвращайся! 😊",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await message.answer("Нет активного ожидания оплаты. Всё в порядке! 😊")
+
+
+# ── Callback: кнопка «Поддержать автора» ─────────────────────────────────────
+@dp.callback_query(F.data == CB_DONATE)
+async def callback_donate(callback: CallbackQuery) -> None:
+    await callback.answer()
+    user_id = callback.from_user.id
+    user_log.info("💛 ДОНАТ — ОТКРЫТ ДИАЛОГ | пользователь=%s", _u(callback.from_user))
+
+    _awaiting_donate_amount.add(user_id)
+
+    await callback.message.answer(
+        f'<tg-emoji emoji-id="{E_DONATE}">⭐</tg-emoji> <b>Поддержка проекта</b>\n'
+        f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
+        f"Привет! 👋 Этот бот полностью <b>бесплатен</b> — я не беру с тебя "
+        f"ни копейки за его использование.\n\n"
+        f"Если бот оказался полезным и ты хочешь поддержать автора — "
+        f"я буду безмерно благодарен! Любая сумма важна и мотивирует "
+        f"развивать проект дальше 🚀\n\n"
+        f"<b>Как задонатить:</b>\n"
+        f"Просто напиши <b>число</b> — сколько ⭐ звёзд тебе не жалко.\n"
+        f"Минимум — <code>1</code>, максимум — <code>2500</code> за один раз.\n\n"
+        f"<b>Например:</b> <code>10</code> или <code>50</code> или <code>100</code>\n\n"
+        f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
+        f"💡 Если передумал — напиши <code>/cancel_donate</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ── PreCheckout — подтверждаем платёж ────────────────────────────────────────
+@dp.pre_checkout_query()
+async def pre_checkout_handler(query: PreCheckoutQuery) -> None:
+    user_log.info(
+        "💳 PRE_CHECKOUT | пользователь=%s | сумма=%s ⭐",
+        _u(query.from_user), query.total_amount,
+    )
+    await query.answer(ok=True)
+
+
+# ── Успешный платёж ───────────────────────────────────────────────────────────
+@dp.message(F.successful_payment)
+async def successful_payment_handler(message: Message) -> None:
+    payment  = message.successful_payment
+    stars    = payment.total_amount
+    user     = message.from_user
+    username = f"@{user.username}" if user.username else f"без username (id={user.id})"
+    name     = user.full_name or "NoName"
+
+    user_log.info("✅ ДОНАТ ПОЛУЧЕН | пользователь=%s | сумма=%s ⭐", _u(user), stars)
+
+    # Благодарность пользователю
+    await message.answer(
+        f'<tg-emoji emoji-id="{E_DONATE}">⭐</tg-emoji> <b>Огромное спасибо!</b>\n'
+        f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
+        f"Ты отправил <b>{stars} ⭐</b> — это очень приятно и мотивирует "
+        f"продолжать развивать бота! 🙏\n\n"
+        f"Я обязательно напишу тебе лично, чтобы поблагодарить!\n\n"
+        f"<i>С уважением, <a href='https://t.me/balfikovich'>@balfikovich</a></i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+    # Уведомление админу
+    try:
+        await bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                f"🔔 <b>Новый донат!</b>\n"
+                f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
+                f"👤 <b>Имя:</b> {name}\n"
+                f"📎 <b>Username:</b> {username}\n"
+                f"⭐ <b>Сумма:</b> {stars} звёзд\n"
+                f"🆔 <b>User ID:</b> <code>{user.id}</code>"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        user_log.info("   └─ уведомление отправлено админу (id=%s)", ADMIN_ID)
+    except Exception as e:
+        logger.error("Не удалось уведомить админа о донате: %s", e)
 
 
 # ── Обработка текста (личка + группа) ────────────────────────────────────────
 @dp.message(F.text)
 async def handle_text(message: Message) -> None:
-    # Сообщения без отправителя (каналы, системные) — игнорируем
     if not message.from_user:
         return
 
     raw_text   = (message.text or "").strip()
     is_private = message.chat.type == "private"
+    user_id    = message.from_user.id
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # ДОНАТ: перехватываем ввод суммы
+    # ─────────────────────────────────────────────────────────────────────────
+    if is_private and user_id in _awaiting_donate_amount:
+        amount_str = raw_text.strip()
+
+        if amount_str.isdigit():
+            amount = int(amount_str)
+            if amount < 1:
+                await message.answer(
+                    "⚠️ Минимальная сумма — <b>1 звезда ⭐</b>. Введи число от 1 и выше.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            if amount > 2500:
+                await message.answer(
+                    "⚠️ Максимум за один платёж — <b>2500 звёзд</b>.\nВведи число от 1 до 2500.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+
+            _awaiting_donate_amount.discard(user_id)
+            user_log.info(
+                "💛 ДОНАТ — ВЫСТАВЛЯЕМ ЧЕК | пользователь=%s | сумма=%s ⭐",
+                _u(message.from_user), amount,
+            )
+
+            try:
+                await bot.send_invoice(
+                    chat_id=message.chat.id,
+                    title="⭐ Поддержка автора",
+                    description=(
+                        f"Донат автору бота NFT Gift Viewer — {amount} звёзд.\n"
+                        "Спасибо за поддержку! 🙏"
+                    ),
+                    payload=f"donate_{user_id}_{amount}",
+                    currency="XTR",          # Telegram Stars
+                    prices=[LabeledPrice(label="Звёзды", amount=amount)],
+                    provider_token="",       # для Stars не нужен
+                )
+            except Exception as e:
+                logger.error("send_invoice error: %s", e)
+                _awaiting_donate_amount.add(user_id)  # возвращаем в режим ввода
+                await message.answer(
+                    "❌ Не удалось создать счёт. Попробуй ещё раз или напиши другую сумму.",
+                    parse_mode=ParseMode.HTML,
+                )
+        else:
+            await message.answer(
+                "⚠️ Пожалуйста, введи <b>число</b> — количество звёзд.\n\n"
+                "Например: <code>10</code>\n\n"
+                "Если передумал — напиши <code>/cancel_donate</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        return
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Обычная логика: поиск превью
+    # ─────────────────────────────────────────────────────────────────────────
     if not is_private:
         lower = raw_text.lower()
         if not (lower.startswith("превью") or lower.startswith("preview")):
@@ -631,7 +789,6 @@ async def handle_text(message: Message) -> None:
 
     slug = extract_nft_slug(raw_text)
 
-    # ── Неверный формат ───────────────────────────────────────────────────────
     if not slug:
         user_log.info(
             "❓ НЕВЕРНЫЙ ФОРМАТ | пользователь=%s | чат=%s | текст=%r",
@@ -659,16 +816,12 @@ async def handle_text(message: Message) -> None:
             )
         return
 
-    user_id = message.from_user.id
-    where   = "личка" if is_private else "группа"
-
-    # ── Логируем запрос ───────────────────────────────────────────────────────
+    where = "личка" if is_private else "группа"
     user_log.info(
-        "🎁 ЗАПРОС | slug=%s | пользователь=%s | чат=%s | тип=%s",
+        "🎁 ЗАПРОС ПРЕВЬЮ | slug=%s | пользователь=%s | чат=%s | тип=%s",
         slug, _u(message.from_user), _chat(message.chat), where,
     )
 
-    # ── Антиспам ──────────────────────────────────────────────────────────────
     if not is_private:
         slug_wait = check_slug_antispam(user_id, slug)
         if slug_wait > 0:
@@ -700,7 +853,6 @@ async def handle_text(message: Message) -> None:
             )
             return
 
-    # ── Загрузка ──────────────────────────────────────────────────────────────
     t_start  = time.monotonic()
     wait_msg = await message.answer(
         f"🔍 Загружаю <b>{slug}</b>…",
@@ -712,7 +864,6 @@ async def handle_text(message: Message) -> None:
 
     await safe_delete(wait_msg)
 
-    # ── Ошибка загрузки ───────────────────────────────────────────────────────
     if error:
         user_log.warning(
             "⚠️ ОШИБКА ЗАГРУЗКИ | slug=%s | пользователь=%s | ошибка=%s | время=%.2fс",
@@ -726,7 +877,6 @@ async def handle_text(message: Message) -> None:
         )
         return
 
-    # ── Не найден ─────────────────────────────────────────────────────────────
     if not found:
         user_log.info(
             "❌ НЕ НАЙДЕН | slug=%s | пользователь=%s | время=%.2fс",
@@ -745,13 +895,12 @@ async def handle_text(message: Message) -> None:
         )
         return
 
-    # ── Успех ─────────────────────────────────────────────────────────────────
     model_info = attrs.model + (f" ({attrs.model_rarity})" if attrs.model_rarity else "")
     back_info  = attrs.backdrop + (f" ({attrs.backdrop_rarity})" if attrs.backdrop_rarity else "")
     sym_info   = attrs.symbol + (f" ({attrs.symbol_rarity})" if attrs.symbol_rarity else "")
 
     user_log.info(
-        "✅ УСПЕХ | slug=%s | модель=%s | фон=%s | символ=%s | пользователь=%s | время=%.2fс",
+        "✅ ПРЕВЬЮ ОТПРАВЛЕНО | slug=%s | модель=%s | фон=%s | символ=%s | пользователь=%s | время=%.2fс",
         slug, model_info, back_info, sym_info, _u(message.from_user), elapsed,
     )
 
@@ -775,7 +924,7 @@ async def callback_no_compress(callback: CallbackQuery) -> None:
 
     if _cb_lock.get(user_id):
         user_log.info(
-            "🔒 КНОПКА ЗАБЛОКИРОВАНА (идёт загрузка) | slug=%s | пользователь=%s",
+            "🔒 КНОПКА ЗАБЛОКИРОВАНА | slug=%s | пользователь=%s",
             slug, _u(callback.from_user),
         )
         await callback.answer("⏳ Подожди, идёт загрузка…", show_alert=False)
@@ -790,7 +939,6 @@ async def callback_no_compress(callback: CallbackQuery) -> None:
         await callback.answer(f"⏳ Подожди {wait_sec} сек.", show_alert=True)
         return
 
-    # ИСПРАВЛЕНИЕ #5: ключ по message_id — разные люди могут нажать кнопку
     no_compress_key = f"{message_id}:{slug.lower()}"
 
     if no_compress_key in _used_no_compress:
@@ -829,7 +977,7 @@ async def callback_no_compress(callback: CallbackQuery) -> None:
 
         _used_no_compress.add(no_compress_key)
 
-        # ИСПРАВЛЕНИЕ #4: убираем кнопку после нажатия
+        # Убираем кнопку после нажатия
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
         except Exception:
@@ -861,10 +1009,10 @@ async def inline_handler(query: InlineQuery) -> None:
             thumbnail_url="https://nft.fragment.com/gift/PlushPepe-1.webp",
             input_message_content=InputTextMessageContent(
                 message_text=(
-                    f"<b>NFT Gift Viewer</b>\n\n"
-                    f"Добавь бота в чат и отправляй ссылки или названия подарков прямо в чат!\n\n"
-                    f"<code>t.me/nft/PlushPepe-22</code>\n"
-                    f"<code>PlushPepe 22</code>"
+                    "<b>NFT Gift Viewer</b>\n\n"
+                    "Добавь бота в чат и отправляй ссылки или названия подарков!\n\n"
+                    "<code>t.me/nft/PlushPepe-22</code>\n"
+                    "<code>PlushPepe 22</code>"
                 ),
                 parse_mode=ParseMode.HTML,
             ),
@@ -885,9 +1033,9 @@ async def inline_handler(query: InlineQuery) -> None:
             description="Пример: PlushPepe-22 / Plush Pepe 22 / t.me/nft/...",
             input_message_content=InputTextMessageContent(
                 message_text=(
-                    f"<b>Неверный формат</b>\n\n"
-                    f"<code>t.me/nft/PlushPepe-22</code>\n"
-                    f"<code>PlushPepe 22</code>"
+                    "<b>Неверный формат</b>\n\n"
+                    "<code>t.me/nft/PlushPepe-22</code>\n"
+                    "<code>PlushPepe 22</code>"
                 ),
                 parse_mode=ParseMode.HTML,
             ),
@@ -973,6 +1121,7 @@ async def on_startup() -> None:
     logger.info("━" * 60)
     logger.info("✅ БОТ ЗАПУЩЕН: @%s (id=%s)", me.username, me.id)
     logger.info("   Лог-файл: %s", os.path.abspath(LOG_FILE))
+    logger.info("   Донаты → admin_id=%s", ADMIN_ID)
     logger.info("━" * 60)
     logger.info("ЧЕКЛИСТ:")
     logger.info("  1. @BotFather → /setprivacy → @%s → Disable", me.username)
@@ -996,7 +1145,13 @@ async def main() -> None:
     dp.shutdown.register(on_shutdown)
     await dp.start_polling(
         bot,
-        allowed_updates=["message", "callback_query", "inline_query", "my_chat_member"],
+        allowed_updates=[
+            "message",
+            "callback_query",
+            "inline_query",
+            "my_chat_member",
+            "pre_checkout_query",
+        ],
     )
 
 
