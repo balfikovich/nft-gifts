@@ -552,7 +552,10 @@ async def on_bot_added_to_group(event: ChatMemberUpdated) -> None:
 # ── /start ────────────────────────────────────────────────────────────────────
 @dp.message(CommandStart())
 async def cmd_start(message: Message) -> None:
-    is_private = message.chat.type == "private"
+    # В группе /start не отвечаем — приветствие уже отправлено через my_chat_member
+    if message.chat.type != "private":
+        return
+    is_private = True
 
     buttons = []
     if is_private and BOT_USERNAME:
@@ -561,7 +564,7 @@ async def cmd_start(message: Message) -> None:
                 text="➕ Добавить в группу",
                 # t.me/botname?startgroup — открывает диалог выбора группы
                 # показывает только чаты где у пользователя есть права добавлять ботов
-                url=f"https://t.me/{BOT_USERNAME}?startgroup=start",
+                url=f"https://t.me/{BOT_USERNAME}?startgroup",
             )
         ])
 
@@ -577,11 +580,24 @@ async def cmd_start(message: Message) -> None:
 @dp.message(F.text)
 async def handle_text(message: Message) -> None:
     raw_text = (message.text or "").strip()
+    is_private = message.chat.type == "private"
+
+    # В ГРУППЕ реагируем ТОЛЬКО на "превью <нфт>" или "preview <нфт>"
+    # В ЛИЧКЕ — на любое сообщение без префикса
+    if not is_private:
+        lower = raw_text.lower()
+        if not (lower.startswith("превью") or lower.startswith("preview")):
+            return  # не наше сообщение — молчим
+        # Убираем префикс
+        for prefix in ("превью", "preview"):
+            if lower.startswith(prefix):
+                raw_text = raw_text[len(prefix):].strip()
+                break
+
     slug = extract_nft_slug(raw_text)
 
     if not slug:
-        # В группах бот молчит на мусор — не засоряет чат
-        if message.chat.type == "private":
+        if is_private:
             await message.answer(
                 f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> '
                 f"<b>Неверный формат.</b>\n\n"
@@ -589,6 +605,16 @@ async def handle_text(message: Message) -> None:
                 f"<code>t.me/nft/PlushPepe-22</code>\n"
                 f"<code>PlushPepe 22</code>\n"
                 f"<code>Plush Pepe 22</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await message.answer(
+                f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> '
+                f"<b>Неверный формат подарка.</b>\n\n"
+                f"<b>Примеры:</b>\n"
+                f"<code>превью t.me/nft/PlushPepe-22</code>\n"
+                f"<code>превью PlushPepe 22</code>\n"
+                f"<code>превью Plush Pepe 22</code>",
                 parse_mode=ParseMode.HTML,
             )
         return
