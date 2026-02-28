@@ -77,7 +77,7 @@ REQUEST_TIMEOUT    = aiohttp.ClientTimeout(total=20)
 CB_NO_COMPRESS     = "nocompress:"
 AUTHOR             = "@balfikovich"
 ANTISPAM_SECONDS   = 1.5    # личка: минимум между разными запросами
-ANTISPAM_SLUG_SEC  = 120   # группа: повтор одного подарка не чаще раз в 2 мин
+ANTISPAM_SLUG_SEC  = 300   # группа: повтор одного подарка не чаще раз в 2 мин
 
 # ── Custom Emoji IDs ──────────────────────────────────────────────────────────
 E_GIFT   = "5408829285685291820"
