@@ -402,27 +402,13 @@ async def send_photo_with_keyboard(message: Message, png_bytes: bytes, slug: str
     kbd           = make_keyboard(slug)
     file          = BufferedInputFile(png_bytes, filename=f"{slug}.png")
     try:
-        # parse_mode=None ОБЯЗАТЕЛЕН — иначе aiogram берёт дефолтный parse_mode
-        # из конфига бота и перезаписывает caption_entities, ломая custom emoji
-        await message.answer_photo(
-            photo=file,
-            caption=caption,
-            caption_entities=ents,
-            parse_mode=None,          # ← ключевой фикс
-            reply_markup=kbd,
-        )
+        await message.answer_photo(photo=file, caption=caption, caption_entities=ents, reply_markup=kbd)
         return True
     except TelegramRetryAfter as e:
         await asyncio.sleep(e.retry_after)
         try:
             file = BufferedInputFile(png_bytes, filename=f"{slug}.png")
-            await message.answer_photo(
-                photo=file,
-                caption=caption,
-                caption_entities=ents,
-                parse_mode=None,
-                reply_markup=kbd,
-            )
+            await message.answer_photo(photo=file, caption=caption, caption_entities=ents, reply_markup=kbd)
             return True
         except Exception as ex:
             logger.error("Retry failed: %s", ex)
@@ -716,7 +702,6 @@ async def inline_handler(query: InlineQuery) -> None:
         description=description,
         caption=caption,
         caption_entities=ents,
-        parse_mode=None,          # ← не передаём parse_mode, только entities
         reply_markup=kbd,
     )
 
