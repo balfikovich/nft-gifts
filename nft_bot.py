@@ -459,7 +459,7 @@ def get_start_text() -> str:
         f"4. Бот напишет приветствие с правилами\n\n"
         f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
         f"⚡ Проверка ~1–2 сек\n\n"
-        f"<i>Автор: <a href='https://t.me/balfikovich'>@balfikovich</a></i>"
+        f"<i>Автор: @balfikovich</a></i>"
     )
 
 
