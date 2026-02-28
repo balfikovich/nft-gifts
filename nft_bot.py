@@ -3,13 +3,17 @@ Telegram NFT Gift Checker Bot
 Автор: @balfikovich
 
 ВАЖНО — ДО ЗАПУСКА сделай в @BotFather:
-  1. /setinline  → выбери бота → введи placeholder, например:
-        gift link / @username / model name
-     БЕЗ ЭТОГО inline-режим (@бот запрос) НЕ БУДЕТ РАБОТАТЬ!
-  2. /setjoingroups → Enable  (чтобы бота можно было добавлять в группы)
-  3. /setprivacy → Disable  (чтобы бот видел все сообщения в группе)
+  1. /setinline  → выбери бота → введи placeholder:
+        gift link / model name / PlushPepe 22
+  2. /setjoingroups → Enable
+  3. /setprivacy → Disable  ← ОБЯЗАТЕЛЬНО, иначе бот не видит сообщения в группе
 
-Форматы запроса (личка И группа):
+КАК ИСПОЛЬЗОВАТЬ В ГРУППЕ:
+  • Добавь бота в группу и дай права администратора
+  • Бот сам напишет приветствие с инструкцией
+  • Участники пишут ссылку или название подарка — бот отвечает карточкой
+
+Форматы запроса:
   • https://t.me/nft/PlushPepe-22
   • t.me/nft/PlushPepe-22
   • PlushPepe-22
@@ -28,11 +32,12 @@ from typing import Optional
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
-from aiogram.enums import ParseMode
+from aiogram.enums import ParseMode, ChatMemberStatus
 from aiogram.filters import CommandStart
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
+    ChatMemberUpdated,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -42,7 +47,13 @@ from aiogram.types import (
     InlineQueryResultPhoto,
     InputTextMessageContent,
 )
-from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
+from aiogram.filters.chat_member_updated import (
+    ChatMemberUpdatedFilter,
+    IS_NOT_MEMBER,
+    IS_MEMBER,
+    IS_ADMIN,
+)
+from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest, TelegramForbiddenError
 from dotenv import load_dotenv
 
 # ── Конфиг ───────────────────────────────────────────────────────────────────
@@ -110,19 +121,11 @@ def get_session() -> aiohttp.ClientSession:
 #  ПАРСИНГ SLUG
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Формат 1: полная ссылка  t.me/nft/PlushPepe-22
 _RE_LINK = re.compile(
     r"(?:https?://)?t\.me/nft/([A-Za-z0-9]+(?:[_-][A-Za-z0-9]+)*-\d+)",
     re.IGNORECASE,
 )
-
-# Формат 2: slug с дефисом  PlushPepe-22
-_RE_SLUG = re.compile(
-    r"^([A-Za-z][A-Za-z0-9]*)[-](\d+)$",
-    re.IGNORECASE,
-)
-
-# Формат 3: слово(а) + пробел + число  "PlushPepe 22"  "Plush Pepe 22"
+_RE_SLUG = re.compile(r"^([A-Za-z][A-Za-z0-9]*)[-](\d+)$", re.IGNORECASE)
 _RE_WORDS = re.compile(
     r"^([A-Za-z][A-Za-z0-9]*(?:\s+[A-Za-z][A-Za-z0-9]*)*)\s+(\d+)$",
     re.IGNORECASE,
@@ -130,30 +133,16 @@ _RE_WORDS = re.compile(
 
 
 def extract_nft_slug(raw: str) -> Optional[str]:
-    """
-    Поддерживаемые форматы:
-      https://t.me/nft/PlushPepe-22
-      t.me/nft/PlushPepe-22
-      PlushPepe-22
-      PlushPepe 22
-      Plush Pepe 22
-    """
     text = raw.strip()
-
     m = _RE_LINK.search(text)
     if m:
         return m.group(1)
-
     m = _RE_SLUG.match(text)
     if m:
         return f"{m.group(1)}-{m.group(2)}"
-
     m = _RE_WORDS.match(text)
     if m:
-        name   = m.group(1).replace(" ", "")
-        number = m.group(2)
-        return f"{name}-{number}"
-
+        return f"{m.group(1).replace(' ', '')}-{m.group(2)}"
     return None
 
 
@@ -315,6 +304,7 @@ def webp_to_png(webp_bytes: bytes) -> Optional[bytes]:
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CAPTION через entities
+#  parse_mode=None ОБЯЗАТЕЛЕН — иначе Telegram игнорирует entities
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _utf16_len(s: str) -> int:
@@ -387,6 +377,63 @@ def make_keyboard(slug: str) -> InlineKeyboardMarkup:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  ТЕКСТЫ — приветствие в группе и /start в личке
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_group_welcome(chat_title: str) -> str:
+    """Приветственное сообщение когда бота добавляют в группу."""
+    return (
+        f"👋 <b>Привет, {chat_title}!</b>\n\n"
+        f"Я <b>NFT Gift Viewer</b> — показываю карточку любого Telegram NFT-подарка: "
+        f"картинку, модель, фон, символ и редкость.\n\n"
+        f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
+        f"<b>📌 Как пользоваться:</b>\n\n"
+        f"Просто напиши в чат ссылку или название подарка — "
+        f"и я отвечу карточкой с полной информацией.\n\n"
+        f"<b>✅ Поддерживаемые форматы:</b>\n"
+        f"<code>https://t.me/nft/PlushPepe-22</code>\n"
+        f"<code>t.me/nft/PlushPepe-22</code>\n"
+        f"<code>PlushPepe-22</code>\n"
+        f"<code>PlushPepe 22</code>\n"
+        f"<code>Plush Pepe 22</code>\n\n"
+        f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
+        f"⚡ Результат приходит за ~1–2 сек\n"
+        f"🔒 Работает только прямыми сообщениями в этом чате\n\n"
+        f"<i>Автор бота: <a href='https://t.me/balfikovich'>@balfikovich</a></i>"
+    )
+
+
+def get_start_text() -> str:
+    """Текст /start в личке."""
+    bot_name = BOT_USERNAME or "бот"
+    return (
+        f'<tg-emoji emoji-id="{E_START}">✨</tg-emoji> <b>NFT Gift Viewer</b>\n'
+        f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
+        f"Показываю картинку, модель, фон, символ и редкость любого Telegram NFT-подарка.\n\n"
+        f"<b>📨 Как пользоваться в личке:</b>\n"
+        f"Просто отправь ссылку или название подарка — получишь карточку.\n\n"
+        f"<b>✅ Поддерживаемые форматы:</b>\n"
+        f"<code>https://t.me/nft/PlushPepe-22</code>\n"
+        f"<code>t.me/nft/PlushPepe-22</code>\n"
+        f"<code>PlushPepe-22</code>\n"
+        f"<code>PlushPepe 22</code>\n"
+        f"<code>Plush Pepe 22</code>\n\n"
+        f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
+        f"<b>👥 Хочешь использовать в группе?</b>\n"
+        f"1. Нажми кнопку <b>«Добавить в группу»</b> ниже\n"
+        f"2. Выбери свой чат\n"
+        f"3. Дай боту права <b>администратора</b>\n"
+        f"4. Бот напишет приветствие с инструкцией\n"
+        f"5. Участники пишут название/ссылку — бот отвечает карточкой!\n\n"
+        f"<b>🔒 Важно:</b> в группе бот работает только прямыми сообщениями "
+        f"(не нужно упоминать @{bot_name}).\n\n"
+        f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
+        f"⚡ Проверка ~1–2 сек\n\n"
+        f"<i>Автор: <a href='https://t.me/balfikovich'>@balfikovich</a></i>"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  ОТПРАВКА
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -397,18 +444,45 @@ async def safe_delete(msg: Message) -> None:
         pass
 
 
-async def send_photo_with_keyboard(message: Message, png_bytes: bytes, slug: str, attrs: NftAttrs) -> bool:
+async def process_slug(slug: str) -> tuple:
+    (found, webp_data, error), attrs = await asyncio.gather(
+        fetch_nft_image(slug),
+        fetch_nft_attrs(slug),
+    )
+    return found, webp_data, error, attrs
+
+
+async def send_photo_with_keyboard(
+    message: Message,
+    png_bytes: bytes,
+    slug: str,
+    attrs: NftAttrs,
+) -> bool:
     caption, ents = make_caption(slug, attrs)
     kbd           = make_keyboard(slug)
     file          = BufferedInputFile(png_bytes, filename=f"{slug}.png")
     try:
-        await message.answer_photo(photo=file, caption=caption, caption_entities=ents, reply_markup=kbd)
+        # parse_mode=None ОБЯЗАТЕЛЕН — без него Telegram игнорирует
+        # caption_entities и custom emoji не отображаются
+        await message.answer_photo(
+            photo=file,
+            caption=caption,
+            caption_entities=ents,
+            parse_mode=None,
+            reply_markup=kbd,
+        )
         return True
     except TelegramRetryAfter as e:
         await asyncio.sleep(e.retry_after)
         try:
             file = BufferedInputFile(png_bytes, filename=f"{slug}.png")
-            await message.answer_photo(photo=file, caption=caption, caption_entities=ents, reply_markup=kbd)
+            await message.answer_photo(
+                photo=file,
+                caption=caption,
+                caption_entities=ents,
+                parse_mode=None,
+                reply_markup=kbd,
+            )
             return True
         except Exception as ex:
             logger.error("Retry failed: %s", ex)
@@ -434,22 +508,6 @@ async def send_document_only(send_fn, webp_bytes: bytes, slug: str) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ОБЩАЯ ЛОГИКА ОБРАБОТКИ ЗАПРОСА (используется и в личке/группе, и в inline)
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def process_slug(slug: str) -> tuple:
-    """
-    Загружает фото + атрибуты параллельно.
-    Возвращает (found, webp_data, error, attrs).
-    """
-    (found, webp_data, error), attrs = await asyncio.gather(
-        fetch_nft_image(slug),
-        fetch_nft_attrs(slug),
-    )
-    return found, webp_data, error, attrs
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 #  BOT & DISPATCHER
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -457,45 +515,62 @@ bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
 
 
+# ── Бот добавлен в группу — приветствие ──────────────────────────────────────
+@dp.my_chat_member()
+async def on_bot_added_to_group(event: ChatMemberUpdated) -> None:
+    """
+    Срабатывает когда статус бота в чате меняется.
+    Если бота добавили (был не участником → стал участником или админом) —
+    отправляем приветствие с инструкцией.
+    """
+    # Только группы и супергруппы
+    if event.chat.type not in ("group", "supergroup"):
+        return
+
+    old_status = event.old_chat_member.status
+    new_status = event.new_chat_member.status
+
+    # Бота добавили: был left/kicked → стал member/administrator
+    was_outside = old_status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED, "left", "kicked")
+    now_inside  = new_status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, "member", "administrator")
+
+    if was_outside and now_inside:
+        chat_title = event.chat.title or "этот чат"
+        try:
+            await bot.send_message(
+                chat_id=event.chat.id,
+                text=get_group_welcome(chat_title),
+                parse_mode=ParseMode.HTML,
+            )
+            logger.info("✅ Приветствие отправлено в чат: %s (%s)", chat_title, event.chat.id)
+        except TelegramForbiddenError:
+            logger.warning("Нет прав писать в чат %s", event.chat.id)
+        except Exception as e:
+            logger.error("Ошибка отправки приветствия: %s", e)
+
+
 # ── /start ────────────────────────────────────────────────────────────────────
 @dp.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     is_private = message.chat.type == "private"
 
-    text = (
-        f'<tg-emoji emoji-id="{E_START}">✨</tg-emoji> <b>NFT Gift Viewer</b>\n'
-        f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
-        f"Показываю картинку, модель, фон, символ и редкость любого Telegram NFT-подарка.\n\n"
-        f"<b>📨 Как пользоваться:</b>\n"
-        f"Отправь ссылку или название подарка — и я пришлю карточку.\n\n"
-        f"<b>✅ Поддерживаемые форматы:</b>\n"
-        f"<code>https://t.me/nft/PlushPepe-22</code>\n"
-        f"<code>t.me/nft/PlushPepe-22</code>\n"
-        f"<code>PlushPepe-22</code>\n"
-        f"<code>PlushPepe 22</code>\n"
-        f"<code>Plush Pepe 22</code>\n\n"
-        f"<b>👥 В группе / чате:</b>\n"
-        f"Напечатай <code>@{BOT_USERNAME or 'бот'} PlushPepe 22</code> — "
-        f"появится карточка с фото. Нажми на неё — результат отправится в чат!\n\n"
-        f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
-        f"⚡ Проверка ~1–2 сек\n\n"
-        f"<i>Автор: <a href='https://t.me/balfikovich'>{AUTHOR}</a></i>"
-    )
-
     buttons = []
-
-    if is_private:
-        # Кнопка добавления в группу через startgroup deep link
-        # При нажатии открывается стандартный диалог выбора группы Telegram,
-        # где показываются только чаты где у пользователя есть права администратора.
-        add_url = f"https://t.me/{BOT_USERNAME}?startgroup=start" if BOT_USERNAME else None
-        if add_url:
-            buttons.append([
-                InlineKeyboardButton(text="➕ Добавить бота в группу", url=add_url)
-            ])
+    if is_private and BOT_USERNAME:
+        buttons.append([
+            InlineKeyboardButton(
+                text="➕ Добавить в группу",
+                # t.me/botname?startgroup — открывает диалог выбора группы
+                # показывает только чаты где у пользователя есть права добавлять ботов
+                url=f"https://t.me/{BOT_USERNAME}?startgroup=start",
+            )
+        ])
 
     reply_markup = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
-    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+    await message.answer(
+        get_start_text(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=reply_markup,
+    )
 
 
 # ── Обработка текста (личка + группа) ────────────────────────────────────────
@@ -505,6 +580,7 @@ async def handle_text(message: Message) -> None:
     slug = extract_nft_slug(raw_text)
 
     if not slug:
+        # В группах бот молчит на мусор — не засоряет чат
         if message.chat.type == "private":
             await message.answer(
                 f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> '
@@ -528,7 +604,10 @@ async def handle_text(message: Message) -> None:
         )
         return
 
-    wait_msg = await message.answer(f"🔍 Загружаю <b>{slug}</b>…", parse_mode=ParseMode.HTML)
+    wait_msg = await message.answer(
+        f"🔍 Загружаю <b>{slug}</b>…",
+        parse_mode=ParseMode.HTML,
+    )
     found, webp_data, error, attrs = await process_slug(slug)
     await safe_delete(wait_msg)
 
@@ -585,7 +664,9 @@ async def callback_no_compress(callback: CallbackQuery) -> None:
     try:
         found, webp_data, error = await fetch_nft_image(slug)
         if error or not found:
-            await callback.message.answer("❌ Не удалось загрузить" if error else "❌ Подарок не найден")
+            await callback.message.answer(
+                "❌ Не удалось загрузить" if error else "❌ Подарок не найден"
+            )
             return
         await send_document_only(callback.message.answer_document, webp_data, slug)
     finally:
@@ -593,22 +674,13 @@ async def callback_no_compress(callback: CallbackQuery) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  INLINE-РЕЖИМ
-#
-#  КАК ЭТО РАБОТАЕТ:
-#  Пользователь в любом чате набирает @botusername <запрос>
-#  Telegram отправляет боту InlineQuery с этим запросом.
-#  Бот отвечает списком результатов (фото / статья).
-#  Пользователь нажимает — результат отправляется в чат.
-#
-#  ТРЕБОВАНИЕ: в @BotFather обязательно /setinline для этого бота!
+#  INLINE-РЕЖИМ (оставлен, но не является основным)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dp.inline_query()
 async def inline_handler(query: InlineQuery) -> None:
     raw = (query.query or "").strip()
 
-    # ── Пустой запрос: показываем подсказку ──────────────────────────────
     if not raw:
         hint = InlineQueryResultArticle(
             id="hint",
@@ -617,9 +689,8 @@ async def inline_handler(query: InlineQuery) -> None:
             thumbnail_url="https://nft.fragment.com/gift/PlushPepe-1.webp",
             input_message_content=InputTextMessageContent(
                 message_text=(
-                    f'<tg-emoji emoji-id="{E_START}">✨</tg-emoji> '
                     f"<b>NFT Gift Viewer</b>\n\n"
-                    f"Отправь ссылку или название подарка:\n"
+                    f"Добавь бота в чат и отправляй ссылки или названия подарков прямо в чат!\n\n"
                     f"<code>t.me/nft/PlushPepe-22</code>\n"
                     f"<code>PlushPepe 22</code>"
                 ),
@@ -631,7 +702,6 @@ async def inline_handler(query: InlineQuery) -> None:
 
     slug = extract_nft_slug(raw)
 
-    # ── Неверный формат ───────────────────────────────────────────────────
     if not slug:
         err = InlineQueryResultArticle(
             id="err_format",
@@ -639,12 +709,9 @@ async def inline_handler(query: InlineQuery) -> None:
             description="Пример: PlushPepe-22 / Plush Pepe 22 / t.me/nft/...",
             input_message_content=InputTextMessageContent(
                 message_text=(
-                    f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> '
-                    f"<b>Неверный формат запроса</b>\n\n"
-                    f"<b>Примеры:</b>\n"
+                    f"<b>Неверный формат</b>\n\n"
                     f"<code>t.me/nft/PlushPepe-22</code>\n"
-                    f"<code>PlushPepe 22</code>\n"
-                    f"<code>Plush Pepe 22</code>"
+                    f"<code>PlushPepe 22</code>"
                 ),
                 parse_mode=ParseMode.HTML,
             ),
@@ -652,35 +719,26 @@ async def inline_handler(query: InlineQuery) -> None:
         await query.answer(results=[err], cache_time=5, is_personal=True)
         return
 
-    # ── Загружаем фото и атрибуты параллельно ────────────────────────────
     found, webp_data, error, attrs = await process_slug(slug)
-
     name, number = split_slug(slug)
     nice         = readable_name(name)
     title        = f"🎁 {nice} #{number}"
 
-    # ── Подарок не найден / ошибка ────────────────────────────────────────
     if error or not found:
-        description = f"⚠️ {error}" if error else "❌ Подарок не найден или сожжён"
+        description = f"⚠️ {error}" if error else "❌ Подарок не найден"
         not_found = InlineQueryResultArticle(
             id=f"nf_{slug}",
             title=title,
             description=description,
             input_message_content=InputTextMessageContent(
-                message_text=(
-                    f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> '
-                    f"<b>Подарок не найден</b>\n\n"
-                    f"<code>{slug}</code>"
-                ),
+                message_text=f"<b>Подарок не найден</b>\n\n<code>{slug}</code>",
                 parse_mode=ParseMode.HTML,
             ),
         )
         await query.answer(results=[not_found], cache_time=10, is_personal=True)
         return
 
-    # ── Собираем результат ────────────────────────────────────────────────
     caption, ents = make_caption(slug, attrs)
-
     kbd = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🔗 Открыть в Telegram", url=f"https://t.me/nft/{slug}")
     ]])
@@ -691,7 +749,6 @@ async def inline_handler(query: InlineQuery) -> None:
     if attrs.symbol   != "—": desc_parts.append(f"✨ {attrs.symbol}")
     description = "  ·  ".join(desc_parts) if desc_parts else "NFT Подарок"
 
-    # fragment.com отдаёт webp — Telegram принимает его как photo_url в inline
     photo_url = FRAGMENT_IMAGE_URL.format(slug=slug)
 
     result = InlineQueryResultPhoto(
@@ -702,6 +759,7 @@ async def inline_handler(query: InlineQuery) -> None:
         description=description,
         caption=caption,
         caption_entities=ents,
+        parse_mode=None,
         reply_markup=kbd,
     )
 
@@ -719,13 +777,12 @@ async def on_startup() -> None:
     BOT_USERNAME = me.username or ""
     logger.info("✅ Bot started: @%s (id=%s)", me.username, me.id)
     logger.info("━" * 60)
-    logger.info("ЧЕКЛИСТ (если что-то не работает):")
-    logger.info("  1. @BotFather → /setinline → @%s → введи placeholder", me.username)
-    logger.info("     например: gift link / @username / model name")
-    logger.info("     БЕЗ ЭТОГО inline (@бот запрос) НЕ РАБОТАЕТ!")
+    logger.info("ЧЕКЛИСТ:")
+    logger.info("  1. @BotFather → /setprivacy → @%s → Disable", me.username)
+    logger.info("     БЕЗ ЭТОГО бот не видит сообщения в группах!")
     logger.info("  2. @BotFather → /setjoingroups → @%s → Enable", me.username)
-    logger.info("  3. @BotFather → /setprivacy → @%s → Disable", me.username)
-    logger.info("     (чтобы бот видел сообщения в группе, не только команды)")
+    logger.info("  3. @BotFather → /setinline → @%s → placeholder", me.username)
+    logger.info("  4. В группе дать боту права администратора")
     logger.info("━" * 60)
 
 
@@ -742,7 +799,7 @@ async def main() -> None:
     dp.shutdown.register(on_shutdown)
     await dp.start_polling(
         bot,
-        allowed_updates=["message", "callback_query", "inline_query"],
+        allowed_updates=["message", "callback_query", "inline_query", "my_chat_member"],
     )
 
 
