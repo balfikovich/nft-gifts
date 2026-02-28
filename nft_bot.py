@@ -427,7 +427,7 @@ def get_group_welcome(chat_title: str) -> str:
         f"• Повтор одного подарка — не чаще <b>1 раза в 2 минуты</b>\n"
         f"• Кнопка <b>«Отправить без сжатия»</b> — только 1 раз на превью\n\n"
         f"⚡ Результат приходит за ~1–2 сек\n\n"
-        f"<i>Автор бота: <a href='https://t.me/balfikovich'>@balfikovich</a></i>"
+        f"<i>Автор бота: @balfikovich</a></i>"
     )
 
 
