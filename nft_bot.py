@@ -76,7 +76,8 @@ FRAGMENT_IMAGE_URL = "https://nft.fragment.com/gift/{slug}.webp"
 REQUEST_TIMEOUT    = aiohttp.ClientTimeout(total=20)
 CB_NO_COMPRESS     = "nocompress:"
 AUTHOR             = "@balfikovich"
-ANTISPAM_SECONDS   = 1.5
+ANTISPAM_SECONDS   = 1.5    # личка: минимум между разными запросами
+ANTISPAM_SLUG_SEC  = 120   # группа: повтор одного подарка не чаще раз в 2 мин
 
 # ── Custom Emoji IDs ──────────────────────────────────────────────────────────
 E_GIFT   = "5408829285685291820"
@@ -89,20 +90,38 @@ E_ERR    = "5408930028438188841"
 E_START  = "6028495398941759268"
 
 # ── Антиспам ──────────────────────────────────────────────────────────────────
-_last_request: dict[int, float] = {}
-_cb_lock: dict[int, bool] = {}
+_last_request: dict[int, float] = {}   # user_id → время последнего запроса (личка)
+_last_slug: dict[str, float] = {}       # "user_id:slug" → время последнего запроса
+_cb_lock: dict[int, bool] = {}          # user_id → блокировка callback
+_used_no_compress: set[str] = set()     # "user_id:slug" → уже нажимал без сжатия
 
 # ── Имя бота (заполняется при старте) ────────────────────────────────────────
 BOT_USERNAME: str = ""
 
 
 def check_antispam(user_id: int) -> float:
+    """Общий антиспам для лички: минимальная пауза между запросами."""
     now  = time.monotonic()
     last = _last_request.get(user_id, 0.0)
     diff = now - last
     if diff < ANTISPAM_SECONDS:
         return round(ANTISPAM_SECONDS - diff, 1)
     _last_request[user_id] = now
+    return 0.0
+
+
+def check_slug_antispam(user_id: int, slug: str) -> float:
+    """Антиспам для группы: один и тот же подарок не чаще раза в 2 минуты."""
+    key = f"{user_id}:{slug.lower()}"
+    now  = time.monotonic()
+    last = _last_slug.get(key, 0.0)
+    diff = now - last
+    if diff < ANTISPAM_SLUG_SEC:
+        remaining = int(ANTISPAM_SLUG_SEC - diff)
+        mins = remaining // 60
+        secs = remaining % 60
+        return mins * 60 + secs  # возвращаем секунды
+    _last_slug[key] = now
     return 0.0
 
 
@@ -388,17 +407,19 @@ def get_group_welcome(chat_title: str) -> str:
         f"картинку, модель, фон, символ и редкость.\n\n"
         f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
         f"<b>📌 Как пользоваться:</b>\n\n"
-        f"Просто напиши в чат ссылку или название подарка — "
-        f"и я отвечу карточкой с полной информацией.\n\n"
-        f"<b>✅ Поддерживаемые форматы:</b>\n"
-        f"<code>https://t.me/nft/PlushPepe-22</code>\n"
-        f"<code>t.me/nft/PlushPepe-22</code>\n"
-        f"<code>PlushPepe-22</code>\n"
-        f"<code>PlushPepe 22</code>\n"
-        f"<code>Plush Pepe 22</code>\n\n"
+        f"Напиши слово <b>превью</b> и через пробел ссылку или название подарка.\n\n"
+        f"<b>✅ Примеры:</b>\n"
+        f"<code>превью https://t.me/nft/PlushPepe-22</code>\n"
+        f"<code>превью t.me/nft/PlushPepe-22</code>\n"
+        f"<code>превью PlushPepe-22</code>\n"
+        f"<code>превью PlushPepe 22</code>\n"
+        f"<code>превью Plush Pepe 22</code>\n\n"
         f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
-        f"⚡ Результат приходит за ~1–2 сек\n"
-        f"🔒 Работает только прямыми сообщениями в этом чате\n\n"
+        f"<b>📋 Правила:</b>\n"
+        f"• Сообщение должно начинаться со слова <b>превью</b>\n"
+        f"• Повтор одного подарка — не чаще <b>1 раза в 2 минуты</b>\n"
+        f"• Кнопка <b>«Отправить без сжатия»</b> — только 1 раз на превью\n\n"
+        f"⚡ Результат приходит за ~1–2 сек\n\n"
         f"<i>Автор бота: <a href='https://t.me/balfikovich'>@balfikovich</a></i>"
     )
 
@@ -412,21 +433,25 @@ def get_start_text() -> str:
         f"Показываю картинку, модель, фон, символ и редкость любого Telegram NFT-подарка.\n\n"
         f"<b>📨 Как пользоваться в личке:</b>\n"
         f"Просто отправь ссылку или название подарка — получишь карточку.\n\n"
-        f"<b>✅ Поддерживаемые форматы:</b>\n"
+        f"<b>✅ Форматы (личка — без префикса):</b>\n"
         f"<code>https://t.me/nft/PlushPepe-22</code>\n"
         f"<code>t.me/nft/PlushPepe-22</code>\n"
         f"<code>PlushPepe-22</code>\n"
         f"<code>PlushPepe 22</code>\n"
         f"<code>Plush Pepe 22</code>\n\n"
         f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
-        f"<b>👥 Хочешь использовать в группе?</b>\n"
+        f"<b>👥 Использование в группе / чате:</b>\n"
+        f"В группе нужно писать слово <b>превью</b> перед названием:\n"
+        f"<code>превью PlushPepe 22</code>\n"
+        f"<code>превью t.me/nft/PlushPepe-22</code>\n\n"
+        f"<b>📋 Правила в группе:</b>\n"
+        f"• Повтор одного подарка — не чаще <b>1 раза в 2 минуты</b>\n"
+        f"• <b>«Без сжатия»</b> — только 1 раз на одно превью\n\n"
+        f"<b>🚀 Добавить бота в группу:</b>\n"
         f"1. Нажми кнопку <b>«Добавить в группу»</b> ниже\n"
         f"2. Выбери свой чат\n"
         f"3. Дай боту права <b>администратора</b>\n"
-        f"4. Бот напишет приветствие с инструкцией\n"
-        f"5. Участники пишут название/ссылку — бот отвечает карточкой!\n\n"
-        f"<b>🔒 Важно:</b> в группе бот работает только прямыми сообщениями "
-        f"(не нужно упоминать @{bot_name}).\n\n"
+        f"4. Бот напишет приветствие с правилами\n\n"
         f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
         f"⚡ Проверка ~1–2 сек\n\n"
         f"<i>Автор: <a href='https://t.me/balfikovich'>@balfikovich</a></i>"
@@ -621,14 +646,30 @@ async def handle_text(message: Message) -> None:
 
     user_id = message.from_user.id
 
-    wait_sec = check_antispam(user_id)
-    if wait_sec > 0:
-        await message.answer(
-            f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
-            f"<b>Слишком быстро!</b> Подожди ещё <code>{wait_sec}</code> сек.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
+    # Антиспам: в группе — 2 минуты на один и тот же подарок
+    #           в личке — общий 1.5 сек между любыми запросами
+    if not is_private:
+        slug_wait = check_slug_antispam(user_id, slug)
+        if slug_wait > 0:
+            mins = slug_wait // 60
+            secs = slug_wait % 60
+            time_str = f"{mins} мин {secs} сек" if mins > 0 else f"{secs} сек"
+            await message.answer(
+                f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
+                f"<b>Этот подарок уже был показан.</b>\n"
+                f"Повтор доступен через <code>{time_str}</code>.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+    else:
+        wait_sec = check_antispam(user_id)
+        if wait_sec > 0:
+            await message.answer(
+                f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
+                f"<b>Слишком быстро!</b> Подожди ещё <code>{wait_sec}</code> сек.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
 
     wait_msg = await message.answer(
         f"🔍 Загружаю <b>{slug}</b>…",
@@ -684,6 +725,15 @@ async def callback_no_compress(callback: CallbackQuery) -> None:
         await callback.answer(f"⏳ Подожди {wait_sec} сек.", show_alert=True)
         return
 
+    # Проверяем: эту кнопку уже нажимали для этого подарка?
+    no_compress_key = f"{user_id}:{slug.lower()}"
+    if no_compress_key in _used_no_compress:
+        await callback.answer(
+            "❌ Оригинал уже отправлялся для этого подарка!",
+            show_alert=True,
+        )
+        return
+
     _cb_lock[user_id] = True
     await callback.answer("⏳ Загружаю оригинал…", show_alert=False)
 
@@ -694,6 +744,8 @@ async def callback_no_compress(callback: CallbackQuery) -> None:
                 "❌ Не удалось загрузить" if error else "❌ Подарок не найден"
             )
             return
+        # Помечаем что для этого подарка оригинал уже отправлен
+        _used_no_compress.add(no_compress_key)
         await send_document_only(callback.message.answer_document, webp_data, slug)
     finally:
         _cb_lock[user_id] = False
