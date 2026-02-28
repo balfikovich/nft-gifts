@@ -12,876 +12,993 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode, ChatMemberStatus
 from aiogram.filters import CommandStart
 from aiogram.types import (
-BufferedInputFile,
-CallbackQuery,
-ChatMemberUpdated,
-InlineKeyboardButton,
-InlineKeyboardMarkup,
-Message,
-MessageEntity,
-InlineQuery,
-InlineQueryResultArticle,
-InlineQueryResultPhoto,
-InputTextMessageContent,
+    BufferedInputFile,
+    CallbackQuery,
+    ChatMemberUpdated,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    MessageEntity,
+    InlineQuery,
+    InlineQueryResultArticle,
+    InlineQueryResultPhoto,
+    InputTextMessageContent,
 )
 from aiogram.filters.chat_member_updated import (
-ChatMemberUpdatedFilter,
-IS_NOT_MEMBER,
-IS_MEMBER,
-IS_ADMIN,
+    ChatMemberUpdatedFilter,
+    IS_NOT_MEMBER,
+    IS_MEMBER,
+    IS_ADMIN,
 )
 from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest, TelegramForbiddenError
 from dotenv import load_dotenv
 
 # ── Конфиг ───────────────────────────────────────────────────────────────────
-
 load_dotenv()
 
-BOT_TOKEN: str = os.environ.get(“BOT_TOKEN”, “8748246335:AAGgirhqiuwgnxVO8jYmdhCO7pbThTFiL0s”)
+BOT_TOKEN: str = os.environ.get("BOT_TOKEN", "8748246335:AAGgirhqiuwgnxVO8jYmdhCO7pbThTFiL0s")
 if not BOT_TOKEN:
-raise RuntimeError(“BOT_TOKEN не задан! Создай .env: BOT_TOKEN=xxx”)
+    raise RuntimeError("BOT_TOKEN не задан! Создай .env: BOT_TOKEN=xxx")
 
-# ── Логирование ───────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  ЛОГИРОВАНИЕ
+#  - Консоль: всё что происходит, читаемо
+#  - Файл bot.log: то же самое, хранится на диске
+#  - logger      → технические ошибки (HTTP, PIL, и т.д.)
+#  - user_log    → действия пользователей (кто что запросил)
+# ══════════════════════════════════════════════════════════════════════════════
 
-logging.basicConfig(
-level=logging.INFO,
-format=”%(asctime)s [%(levelname)s] %(name)s: %(message)s”,
-datefmt=”%Y-%m-%d %H:%M:%S”,
+LOG_FILE = os.environ.get("LOG_FILE", "bot.log")
+
+_fmt = logging.Formatter(
+    fmt="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger(**name**)
+
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(_fmt)
+
+_file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+_file_handler.setFormatter(_fmt)
+
+logging.basicConfig(level=logging.INFO, handlers=[_console_handler, _file_handler])
+
+logger   = logging.getLogger(__name__)       # технические события
+user_log = logging.getLogger("user_events")  # действия пользователей
+
+
+def _u(user) -> str:
+    """Имя + @username + id пользователя."""
+    if user is None:
+        return "unknown"
+    name  = (user.full_name or "").strip() or "NoName"
+    uname = f" @{user.username}" if user.username else ""
+    return f"{name}{uname} (id={user.id})"
+
+
+def _chat(chat) -> str:
+    """Название + тип + id чата."""
+    if chat is None:
+        return "unknown"
+    title = (
+        getattr(chat, "title", None)
+        or getattr(chat, "full_name", None)
+        or "NoTitle"
+    ).strip()
+    return f'"{title}" [{chat.type}] (id={chat.id})'
+
 
 # ── Константы ─────────────────────────────────────────────────────────────────
-
-FRAGMENT_IMAGE_URL = “https://nft.fragment.com/gift/{slug}.webp”
+FRAGMENT_IMAGE_URL = "https://nft.fragment.com/gift/{slug}.webp"
 REQUEST_TIMEOUT    = aiohttp.ClientTimeout(total=20)
-CB_NO_COMPRESS     = “nocompress:”
-AUTHOR             = “@balfikovich”
-ANTISPAM_SECONDS   = 1.5    # личка: минимум между разными запросами
-ANTISPAM_SLUG_SEC  = 300   # группа: повтор одного подарка не чаще раз в 2 мин
+CB_NO_COMPRESS     = "nocompress:"
+AUTHOR             = "@balfikovich"
+ANTISPAM_SECONDS   = 1.5
+ANTISPAM_SLUG_SEC  = 300
 
 # ── Custom Emoji IDs ──────────────────────────────────────────────────────────
-
-E_GIFT   = “5408829285685291820”
-E_MODEL  = “5408894951440279259”
-E_BACK   = “5411585799990830248”
-E_SYMBOL = “5409189019261103031”
-E_LINK   = “5409143419593321597”
-E_WARN   = “5409124594751660992”
-E_ERR    = “5408930028438188841”
-E_START  = “6028495398941759268”
+E_GIFT   = "5408829285685291820"
+E_MODEL  = "5408894951440279259"
+E_BACK   = "5411585799990830248"
+E_SYMBOL = "5409189019261103031"
+E_LINK   = "5409143419593321597"
+E_WARN   = "5409124594751660992"
+E_ERR    = "5408930028438188841"
+E_START  = "6028495398941759268"
 
 # ── Антиспам ──────────────────────────────────────────────────────────────────
+_last_request: dict[int, float] = {}
+_last_slug: dict[str, float]    = {}
+_cb_lock: dict[int, bool]       = {}
+_used_no_compress: set[str]     = set()   # "message_id:slug"
 
-_last_request: dict[int, float] = {}   # user_id → время последнего запроса (личка)
-_last_slug: dict[str, float] = {}       # “user_id:slug” → время последнего запроса
-_cb_lock: dict[int, bool] = {}          # user_id → блокировка callback
+# ── Имя бота ─────────────────────────────────────────────────────────────────
+BOT_USERNAME: str = ""
 
-# ── ИСПРАВЛЕНИЕ #5: Ключ теперь “message_id:slug”, а не “user_id:slug”
-
-# Это позволяет разным пользователям нажать кнопку на одном превью
-
-_used_no_compress: set[str] = set()     # “message_id:slug” → уже нажата кнопка
-
-# ── Имя бота (заполняется при старте) ────────────────────────────────────────
-
-BOT_USERNAME: str = “”
 
 def check_antispam(user_id: int) -> float:
-“””
-Общий антиспам для лички.
+    """Возвращает 0 если можно пропустить, иначе — сколько ждать."""
+    now  = time.monotonic()
+    last = _last_request.get(user_id, 0.0)
+    diff = now - last
+    if diff < ANTISPAM_SECONDS:
+        return round(ANTISPAM_SECONDS - diff, 1)
+    # Обновляем время только когда пропускаем запрос
+    _last_request[user_id] = now
+    return 0.0
 
-```
-ИСПРАВЛЕНИЕ #3: счётчик НЕ обновляется если пользователь в блокировке.
-Раньше время записывалось при любом вызове, поэтому пользователь,
-который слал запросы быстро, никогда не мог «дождаться» окончания паузы.
-Теперь время обновляется только когда запрос пропускается (возвращаем 0).
-"""
-now  = time.monotonic()
-last = _last_request.get(user_id, 0.0)
-diff = now - last
-if diff < ANTISPAM_SECONDS:
-    return round(ANTISPAM_SECONDS - diff, 1)
-# Пропускаем — только сейчас обновляем время
-_last_request[user_id] = now
-return 0.0
-```
 
 def check_slug_antispam(user_id: int, slug: str) -> float:
-“”“Антиспам для группы: один и тот же подарок не чаще раза в 2 минуты.”””
-key = f”{user_id}:{slug.lower()}”
-now  = time.monotonic()
-last = _last_slug.get(key, 0.0)
-diff = now - last
-if diff < ANTISPAM_SLUG_SEC:
-remaining = int(ANTISPAM_SLUG_SEC - diff)
-mins = remaining // 60
-secs = remaining % 60
-return mins * 60 + secs  # возвращаем секунды
-_last_slug[key] = now
-return 0.0
+    key  = f"{user_id}:{slug.lower()}"
+    now  = time.monotonic()
+    last = _last_slug.get(key, 0.0)
+    diff = now - last
+    if diff < ANTISPAM_SLUG_SEC:
+        return int(ANTISPAM_SLUG_SEC - diff)
+    _last_slug[key] = now
+    return 0.0
+
 
 # ── HTTP-сессия ───────────────────────────────────────────────────────────────
-
 http_session: Optional[aiohttp.ClientSession] = None
 
+
 def get_session() -> aiohttp.ClientSession:
-global http_session
-if http_session is None or http_session.closed:
-http_session = aiohttp.ClientSession(timeout=REQUEST_TIMEOUT)
-return http_session
+    global http_session
+    if http_session is None or http_session.closed:
+        http_session = aiohttp.ClientSession(timeout=REQUEST_TIMEOUT)
+    return http_session
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-
-# ПАРСИНГ SLUG
-
+#  ПАРСИНГ SLUG
 # ══════════════════════════════════════════════════════════════════════════════
 
-*RE_LINK = re.compile(
-r”(?:https?://)?t.me/nft/([A-Za-z0-9]+(?:[*-][A-Za-z0-9]+)*-\d+)”,
-re.IGNORECASE,
+_RE_LINK = re.compile(
+    r"(?:https?://)?t\.me/nft/([A-Za-z0-9]+(?:[_-][A-Za-z0-9]+)*-\d+)",
+    re.IGNORECASE,
 )
-_RE_SLUG = re.compile(r”^([A-Za-z][A-Za-z0-9]*)[-](\d+)$”, re.IGNORECASE)
+_RE_SLUG  = re.compile(r"^([A-Za-z][A-Za-z0-9]*)[-](\d+)$", re.IGNORECASE)
 _RE_WORDS = re.compile(
-r”^([A-Za-z][A-Za-z0-9]*(?:\s+[A-Za-z][A-Za-z0-9]*)*)\s+(\d+)$”,
-re.IGNORECASE,
+    r"^([A-Za-z][A-Za-z0-9]*(?:\s+[A-Za-z][A-Za-z0-9]*)*)\s+(\d+)$",
+    re.IGNORECASE,
 )
+
 
 def extract_nft_slug(raw: str) -> Optional[str]:
-text = raw.strip()
-m = _RE_LINK.search(text)
-if m:
-return m.group(1)
-m = _RE_SLUG.match(text)
-if m:
-return f”{m.group(1)}-{m.group(2)}”
-m = _RE_WORDS.match(text)
-if m:
-return f”{m.group(1).replace(’ ’, ‘’)}-{m.group(2)}”
-return None
+    text = raw.strip()
+    m = _RE_LINK.search(text)
+    if m:
+        return m.group(1)
+    m = _RE_SLUG.match(text)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+    m = _RE_WORDS.match(text)
+    if m:
+        return f"{m.group(1).replace(' ', '')}-{m.group(2)}"
+    return None
+
 
 def split_slug(slug: str) -> tuple[str, str]:
-parts = slug.rsplit(”-”, 1)
-return (parts[0], parts[1]) if len(parts) == 2 else (slug, “”)
+    parts = slug.rsplit("-", 1)
+    return (parts[0], parts[1]) if len(parts) == 2 else (slug, "")
+
 
 def readable_name(raw: str) -> str:
-s = re.sub(r”(?<=[a-z])(?=[A-Z])”, “ “, raw)
-return re.sub(r”(?<=[A-Z])(?=[A-Z][a-z])”, “ “, s)
+    s = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", raw)
+    return re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", s)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-
-# АТРИБУТЫ NFT
-
+#  АТРИБУТЫ NFT
 # ══════════════════════════════════════════════════════════════════════════════
 
 class NftAttrs:
-**slots** = (“model”, “model_rarity”, “backdrop”, “backdrop_rarity”,
-“symbol”, “symbol_rarity”)
+    __slots__ = ("model", "model_rarity", "backdrop", "backdrop_rarity",
+                 "symbol", "symbol_rarity")
 
-```
-def __init__(self) -> None:
-    self.model           = "—"
-    self.model_rarity    = ""
-    self.backdrop        = "—"
-    self.backdrop_rarity = ""
-    self.symbol          = "—"
-    self.symbol_rarity   = ""
-```
+    def __init__(self) -> None:
+        self.model           = "—"
+        self.model_rarity    = ""
+        self.backdrop        = "—"
+        self.backdrop_rarity = ""
+        self.symbol          = "—"
+        self.symbol_rarity   = ""
+
 
 def _set_attr(attrs: NftAttrs, label: str, value: str, rarity: str) -> None:
-label = label.lower().strip()
-if not value or value == “—”:
-return
-if “model” in label and attrs.model == “—”:
-attrs.model, attrs.model_rarity = value, rarity
-elif (“backdrop” in label or “background” in label) and attrs.backdrop == “—”:
-attrs.backdrop, attrs.backdrop_rarity = value, rarity
-elif “symbol” in label and attrs.symbol == “—”:
-attrs.symbol, attrs.symbol_rarity = value, rarity
+    label = label.lower().strip()
+    if not value or value == "—":
+        return
+    if "model" in label and attrs.model == "—":
+        attrs.model, attrs.model_rarity = value, rarity
+    elif ("backdrop" in label or "background" in label) and attrs.backdrop == "—":
+        attrs.backdrop, attrs.backdrop_rarity = value, rarity
+    elif "symbol" in label and attrs.symbol == "—":
+        attrs.symbol, attrs.symbol_rarity = value, rarity
+
 
 async def fetch_nft_attrs(slug: str) -> NftAttrs:
-attrs   = NftAttrs()
-url     = f”https://t.me/nft/{slug}”
-headers = {
-“User-Agent”: (
-“Mozilla/5.0 (Windows NT 10.0; Win64; x64) “
-“AppleWebKit/537.36 (KHTML, like Gecko) “
-“Chrome/124.0.0.0 Safari/537.36”
-),
-“Accept-Language”: “en-US,en;q=0.9”,
-}
-try:
-async with get_session().get(url, headers=headers) as resp:
-if resp.status != 200:
-logger.warning(“t.me/nft/%s -> HTTP %s”, slug, resp.status)
-return attrs
-html = await resp.text()
-
-```
+    attrs   = NftAttrs()
+    url     = f"https://t.me/nft/{slug}"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
     try:
-        from bs4 import BeautifulSoup
-    except ImportError:
-        logger.error("beautifulsoup4 не установлен")
-        return attrs
+        async with get_session().get(url, headers=headers) as resp:
+            if resp.status != 200:
+                logger.warning("fetch_attrs | slug=%s | HTTP %s", slug, resp.status)
+                return attrs
+            html = await resp.text()
 
-    soup = BeautifulSoup(html, "lxml")
+        try:
+            from bs4 import BeautifulSoup
+        except ImportError:
+            logger.error("beautifulsoup4 не установлен — pip install beautifulsoup4 lxml")
+            return attrs
 
-    for row in soup.select("tr"):
-        cells = row.find_all("td")
-        if len(cells) < 2:
-            continue
-        label       = cells[0].get_text(strip=True).lower()
-        value_cell  = cells[1]
-        rarity_span = value_cell.find("span")
-        rarity = rarity_span.get_text(strip=True) if rarity_span else ""
-        if rarity_span:
-            rarity_span.decompose()
-        value = value_cell.get_text(strip=True)
-        _set_attr(attrs, label, value, rarity)
+        soup = BeautifulSoup(html, "lxml")
 
-    if attrs.model == "—":
-        for el in soup.find_all(attrs={"data-trait": True}):
-            _set_attr(attrs,
-                      str(el.get("data-trait", "")),
-                      str(el.get("data-value", el.get_text(strip=True))),
-                      str(el.get("data-rarity", "")))
+        for row in soup.select("tr"):
+            cells = row.find_all("td")
+            if len(cells) < 2:
+                continue
+            label       = cells[0].get_text(strip=True).lower()
+            value_cell  = cells[1]
+            rarity_span = value_cell.find("span")
+            rarity = rarity_span.get_text(strip=True) if rarity_span else ""
+            if rarity_span:
+                rarity_span.decompose()
+            value = value_cell.get_text(strip=True)
+            _set_attr(attrs, label, value, rarity)
 
-    if attrs.model == "—":
-        for dt in soup.find_all("dt"):
-            dd = dt.find_next_sibling("dd")
-            if dd:
-                rs = dd.find("span")
-                r  = rs.get_text(strip=True) if rs else ""
-                if rs:
-                    rs.decompose()
-                _set_attr(attrs, dt.get_text(strip=True), dd.get_text(strip=True), r)
+        if attrs.model == "—":
+            for el in soup.find_all(attrs={"data-trait": True}):
+                _set_attr(attrs,
+                          str(el.get("data-trait", "")),
+                          str(el.get("data-value", el.get_text(strip=True))),
+                          str(el.get("data-rarity", "")))
 
-    if attrs.model == "—":
-        meta = soup.find("meta", attrs={"property": "og:description"})
-        if meta:
-            content = str(meta.get("content", ""))
-            for sep in ("·", "\n", ","):
-                if sep in content:
-                    parts = content.split(sep)
-                    break
-            else:
-                parts = [content]
-            for part in parts:
-                if ":" in part:
-                    k, _, v = part.strip().partition(":")
-                    _set_attr(attrs, k.strip(), v.strip(), "")
+        if attrs.model == "—":
+            for dt in soup.find_all("dt"):
+                dd = dt.find_next_sibling("dd")
+                if dd:
+                    rs = dd.find("span")
+                    r  = rs.get_text(strip=True) if rs else ""
+                    if rs:
+                        rs.decompose()
+                    _set_attr(attrs, dt.get_text(strip=True), dd.get_text(strip=True), r)
 
-    if attrs.model == "—":
-        for line in soup.get_text(separator="\n").splitlines():
-            if ":" in line:
-                k, _, v = line.strip().partition(":")
-                if k.strip().lower() in ("model", "backdrop", "background", "symbol") and v.strip():
-                    _set_attr(attrs, k.strip(), v.strip(), "")
+        if attrs.model == "—":
+            meta = soup.find("meta", attrs={"property": "og:description"})
+            if meta:
+                content = str(meta.get("content", ""))
+                for sep in ("·", "\n", ","):
+                    if sep in content:
+                        parts = content.split(sep)
+                        break
+                else:
+                    parts = [content]
+                for part in parts:
+                    if ":" in part:
+                        k, _, v = part.strip().partition(":")
+                        _set_attr(attrs, k.strip(), v.strip(), "")
 
-except Exception as e:
-    logger.warning("fetch_nft_attrs(%s): %s", slug, e)
-return attrs
-```
+        if attrs.model == "—":
+            for line in soup.get_text(separator="\n").splitlines():
+                if ":" in line:
+                    k, _, v = line.strip().partition(":")
+                    if k.strip().lower() in ("model", "backdrop", "background", "symbol") and v.strip():
+                        _set_attr(attrs, k.strip(), v.strip(), "")
+
+    except Exception as e:
+        logger.warning("fetch_attrs | slug=%s | error=%s", slug, e)
+    return attrs
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-
-# ЗАГРУЗКА ИЗОБРАЖЕНИЯ
-
+#  ЗАГРУЗКА ИЗОБРАЖЕНИЯ
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def fetch_nft_image(slug: str) -> tuple:
-url = FRAGMENT_IMAGE_URL.format(slug=slug)
-try:
-async with get_session().get(url) as resp:
-if resp.status == 200:
-data = await resp.read()
-return (False, None, “Пустой ответ”) if not data else (True, data, None)
-elif resp.status == 404:
-return False, None, None
-return False, None, f”HTTP {resp.status}”
-except asyncio.TimeoutError:
-return False, None, “Таймаут (20 сек)”
-except aiohttp.ClientConnectionError:
-return False, None, “Ошибка соединения”
-except Exception as e:
-return False, None, f”Ошибка: {e}”
+    url = FRAGMENT_IMAGE_URL.format(slug=slug)
+    try:
+        async with get_session().get(url) as resp:
+            if resp.status == 200:
+                data = await resp.read()
+                return (False, None, "Пустой ответ") if not data else (True, data, None)
+            elif resp.status == 404:
+                return False, None, None
+            return False, None, f"HTTP {resp.status}"
+    except asyncio.TimeoutError:
+        return False, None, "Таймаут (20 сек)"
+    except aiohttp.ClientConnectionError:
+        return False, None, "Ошибка соединения"
+    except Exception as e:
+        return False, None, f"Ошибка: {e}"
+
 
 def webp_to_png(webp_bytes: bytes) -> Optional[bytes]:
-try:
-from PIL import Image
-img = Image.open(io.BytesIO(webp_bytes)).convert(“RGBA”)
-buf = io.BytesIO()
-img.save(buf, format=“PNG”)
-return buf.getvalue()
-except Exception as e:
-logger.error(“WebP→PNG: %s”, e)
-return None
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(webp_bytes)).convert("RGBA")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception as e:
+        logger.error("WebP→PNG | error=%s", e)
+        return None
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-
-# CAPTION через entities
-
-# parse_mode=None ОБЯЗАТЕЛЕН — иначе Telegram игнорирует entities
-
+#  CAPTION
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _utf16_len(s: str) -> int:
-return len(s.encode(“utf-16-le”)) // 2
+    return len(s.encode("utf-16-le")) // 2
+
 
 def _utf16_offset(text_so_far: str) -> int:
-return _utf16_len(text_so_far)
+    return _utf16_len(text_so_far)
+
 
 def make_caption(slug: str, attrs: NftAttrs) -> tuple[str, list[MessageEntity]]:
-name, number = split_slug(slug)
-nice = readable_name(name)
+    name, number = split_slug(slug)
+    nice = readable_name(name)
 
-```
-r_model = f" {attrs.model_rarity}"    if attrs.model_rarity    else ""
-r_back  = f" {attrs.backdrop_rarity}" if attrs.backdrop_rarity else ""
-r_sym   = f" {attrs.symbol_rarity}"   if attrs.symbol_rarity   else ""
+    r_model = f" {attrs.model_rarity}"    if attrs.model_rarity    else ""
+    r_back  = f" {attrs.backdrop_rarity}" if attrs.backdrop_rarity else ""
+    r_sym   = f" {attrs.symbol_rarity}"   if attrs.symbol_rarity   else ""
 
-SEP = "━━━━━━━━━━━━━━━━━━━━"
-entities: list[MessageEntity] = []
-t = ""
+    SEP = "━━━━━━━━━━━━━━━━━━━━"
+    entities: list[MessageEntity] = []
+    t = ""
 
-def ce(emoji_char: str, emoji_id: str) -> None:
-    nonlocal t
-    entities.append(MessageEntity(
-        type="custom_emoji",
-        offset=_utf16_offset(t),
-        length=_utf16_len(emoji_char),
-        custom_emoji_id=emoji_id,
-    ))
-    t += emoji_char
+    def ce(emoji_char: str, emoji_id: str) -> None:
+        nonlocal t
+        entities.append(MessageEntity(
+            type="custom_emoji",
+            offset=_utf16_offset(t),
+            length=_utf16_len(emoji_char),
+            custom_emoji_id=emoji_id,
+        ))
+        t += emoji_char
 
-def bold(s: str) -> None:
-    nonlocal t
-    entities.append(MessageEntity(type="bold", offset=_utf16_offset(t), length=_utf16_len(s)))
-    t += s
+    def bold(s: str) -> None:
+        nonlocal t
+        entities.append(MessageEntity(type="bold", offset=_utf16_offset(t), length=_utf16_len(s)))
+        t += s
 
-def code(s: str) -> None:
-    nonlocal t
-    entities.append(MessageEntity(type="code", offset=_utf16_offset(t), length=_utf16_len(s)))
-    t += s
+    def code(s: str) -> None:
+        nonlocal t
+        entities.append(MessageEntity(type="code", offset=_utf16_offset(t), length=_utf16_len(s)))
+        t += s
 
-def link(s: str, url: str) -> None:
-    nonlocal t
-    entities.append(MessageEntity(type="text_link", offset=_utf16_offset(t), length=_utf16_len(s), url=url))
-    t += s
+    def link(s: str, url: str) -> None:
+        nonlocal t
+        entities.append(MessageEntity(type="text_link", offset=_utf16_offset(t), length=_utf16_len(s), url=url))
+        t += s
 
-def p(s: str) -> None:
-    nonlocal t
-    t += s
+    def p(s: str) -> None:
+        nonlocal t
+        t += s
 
-ce("🎁", E_GIFT);  p(" "); bold(f"{nice} #{number}"); p("\n")
-code(SEP);          p("\n")
-ce("🪄", E_MODEL); p(" "); bold("Модель:");  p(f" {attrs.model}{r_model}\n")
-ce("🎨", E_BACK);  p(" "); bold("Фон:");     p(f" {attrs.backdrop}{r_back}\n")
-ce("✨", E_SYMBOL); p(" "); bold("Символ:");  p(f" {attrs.symbol}{r_sym}\n")
-code(SEP);          p("\n")
-ce("🔗", E_LINK);  p(" "); link("Открыть в Telegram", f"https://t.me/nft/{slug}")
+    ce("🎁", E_GIFT);  p(" "); bold(f"{nice} #{number}"); p("\n")
+    code(SEP);          p("\n")
+    ce("🪄", E_MODEL); p(" "); bold("Модель:");  p(f" {attrs.model}{r_model}\n")
+    ce("🎨", E_BACK);  p(" "); bold("Фон:");     p(f" {attrs.backdrop}{r_back}\n")
+    ce("✨", E_SYMBOL); p(" "); bold("Символ:");  p(f" {attrs.symbol}{r_sym}\n")
+    code(SEP);          p("\n")
+    ce("🔗", E_LINK);  p(" "); link("Открыть в Telegram", f"https://t.me/nft/{slug}")
 
-return t, entities
-```
+    return t, entities
+
 
 def make_keyboard(slug: str) -> InlineKeyboardMarkup:
-return InlineKeyboardMarkup(inline_keyboard=[[
-InlineKeyboardButton(
-text=“📤 Отправить без сжатия”,
-callback_data=f”{CB_NO_COMPRESS}{slug}”,
-)
-]])
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="📤 Отправить без сжатия",
+            callback_data=f"{CB_NO_COMPRESS}{slug}",
+        )
+    ]])
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-
-# ТЕКСТЫ — приветствие в группе и /start в личке
-
+#  ТЕКСТЫ
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_group_welcome(chat_title: str) -> str:
-“”“Приветственное сообщение когда бота добавляют в группу.”””
-return (
-f”👋 <b>Привет, {chat_title}!</b>\n\n”
-f”Я <b>NFT Gift Viewer</b> — показываю карточку любого Telegram NFT-подарка: “
-f”картинку, модель, фон, символ и редкость.\n\n”
-f”<code>━━━━━━━━━━━━━━━━━━━━</code>\n”
-f”<b>📌 Как пользоваться:</b>\n\n”
-f”Напиши слово <b>превью</b> и через пробел ссылку или название подарка.\n\n”
-f”<b>✅ Примеры:</b>\n”
-f”<code>превью https://t.me/nft/PlushPepe-22</code>\n”
-f”<code>превью t.me/nft/PlushPepe-22</code>\n”
-f”<code>превью PlushPepe-22</code>\n”
-f”<code>превью PlushPepe 22</code>\n”
-f”<code>превью Plush Pepe 22</code>\n\n”
-f”<code>━━━━━━━━━━━━━━━━━━━━</code>\n”
-f”<b>📋 Правила:</b>\n”
-f”• Сообщение должно начинаться со слова <b>превью</b>\n”
-f”• Повтор одного подарка — не чаще <b>1 раза в 2 минуты</b>\n”
-f”• Кнопка <b>«Отправить без сжатия»</b> — только 1 раз на превью\n\n”
-f”⚡ Результат приходит за ~1–2 сек\n\n”
-f”<i>Автор бота: <a href='https://t.me/balfikovich'>@balfikovich</a></i>”
-)
+    return (
+        f"👋 <b>Привет, {chat_title}!</b>\n\n"
+        f"Я <b>NFT Gift Viewer</b> — показываю карточку любого Telegram NFT-подарка: "
+        f"картинку, модель, фон, символ и редкость.\n\n"
+        f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
+        f"<b>📌 Как пользоваться:</b>\n\n"
+        f"Напиши слово <b>превью</b> и через пробел ссылку или название подарка.\n\n"
+        f"<b>✅ Примеры:</b>\n"
+        f"<code>превью https://t.me/nft/PlushPepe-22</code>\n"
+        f"<code>превью t.me/nft/PlushPepe-22</code>\n"
+        f"<code>превью PlushPepe-22</code>\n"
+        f"<code>превью PlushPepe 22</code>\n"
+        f"<code>превью Plush Pepe 22</code>\n\n"
+        f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
+        f"<b>📋 Правила:</b>\n"
+        f"• Сообщение должно начинаться со слова <b>превью</b>\n"
+        f"• Повтор одного подарка — не чаще <b>1 раза в 2 минуты</b>\n"
+        f"• Кнопка <b>«Отправить без сжатия»</b> — только 1 раз на превью\n\n"
+        f"⚡ Результат приходит за ~1–2 сек\n\n"
+        f"<i>Автор бота: <a href='https://t.me/balfikovich'>@balfikovich</a></i>"
+    )
+
 
 def get_start_text() -> str:
-“”“Текст /start в личке.”””
-bot_name = BOT_USERNAME or “бот”
-return (
-f’<tg-emoji emoji-id="{E_START}">✨</tg-emoji> <b>NFT Gift Viewer</b>\n’
-f”<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n”
-f”Показываю картинку, модель, фон, символ и редкость любого Telegram NFT-подарка.\n\n”
-f”<b>📨 Как пользоваться в личке:</b>\n”
-f”Просто отправь ссылку или название подарка — получишь карточку.\n\n”
-f”<b>✅ Форматы (личка — без префикса):</b>\n”
-f”<code>https://t.me/nft/PlushPepe-22</code>\n”
-f”<code>t.me/nft/PlushPepe-22</code>\n”
-f”<code>PlushPepe-22</code>\n”
-f”<code>PlushPepe 22</code>\n”
-f”<code>Plush Pepe 22</code>\n\n”
-f”<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n”
-f”<b>👥 Использование в группе / чате:</b>\n”
-f”В группе нужно писать слово <b>превью</b> перед названием:\n”
-f”<code>превью PlushPepe 22</code>\n”
-f”<code>превью t.me/nft/PlushPepe-22</code>\n\n”
-f”<b>📋 Правила в группе:</b>\n”
-f”• Повтор одного подарка — не чаще <b>1 раза в 2 минуты</b>\n”
-f”• <b>«Без сжатия»</b> — только 1 раз на одно превью\n\n”
-f”<b>🚀 Добавить бота в группу:</b>\n”
-f”1. Нажми кнопку <b>«Добавить в группу»</b> ниже\n”
-f”2. Выбери свой чат\n”
-f”3. Дай боту права <b>администратора</b>\n”
-f”4. Бот напишет приветствие с правилами\n\n”
-f”<code>━━━━━━━━━━━━━━━━━━━━</code>\n”
-f”⚡ Проверка ~1–2 сек\n\n”
-f”<i>Автор: <a href='https://t.me/balfikovich'>@balfikovich</a></i>”
-)
+    return (
+        f'<tg-emoji emoji-id="{E_START}">✨</tg-emoji> <b>NFT Gift Viewer</b>\n'
+        f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
+        f"Показываю картинку, модель, фон, символ и редкость любого Telegram NFT-подарка.\n\n"
+        f"<b>📨 Как пользоваться в личке:</b>\n"
+        f"Просто отправь ссылку или название подарка — получишь карточку.\n\n"
+        f"<b>✅ Форматы (личка — без префикса):</b>\n"
+        f"<code>https://t.me/nft/PlushPepe-22</code>\n"
+        f"<code>t.me/nft/PlushPepe-22</code>\n"
+        f"<code>PlushPepe-22</code>\n"
+        f"<code>PlushPepe 22</code>\n"
+        f"<code>Plush Pepe 22</code>\n\n"
+        f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
+        f"<b>👥 Использование в группе / чате:</b>\n"
+        f"В группе нужно писать слово <b>превью</b> перед названием:\n"
+        f"<code>превью PlushPepe 22</code>\n"
+        f"<code>превью t.me/nft/PlushPepe-22</code>\n\n"
+        f"<b>📋 Правила в группе:</b>\n"
+        f"• Повтор одного подарка — не чаще <b>1 раза в 2 минуты</b>\n"
+        f"• <b>«Без сжатия»</b> — только 1 раз на одно превью\n\n"
+        f"<b>🚀 Добавить бота в группу:</b>\n"
+        f"1. Нажми кнопку <b>«Добавить в группу»</b> ниже\n"
+        f"2. Выбери свой чат\n"
+        f"3. Дай боту права <b>администратора</b>\n"
+        f"4. Бот напишет приветствие с правилами\n\n"
+        f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
+        f"⚡ Проверка ~1–2 сек\n\n"
+        f"<i>Автор: <a href='https://t.me/balfikovich'>@balfikovich</a></i>"
+    )
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-
-# ОТПРАВКА
-
+#  ОТПРАВКА
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def safe_delete(msg: Message) -> None:
-try:
-await msg.delete()
-except Exception:
-pass
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
 
 async def process_slug(slug: str) -> tuple:
-(found, webp_data, error), attrs = await asyncio.gather(
-fetch_nft_image(slug),
-fetch_nft_attrs(slug),
-)
-return found, webp_data, error, attrs
+    (found, webp_data, error), attrs = await asyncio.gather(
+        fetch_nft_image(slug),
+        fetch_nft_attrs(slug),
+    )
+    return found, webp_data, error, attrs
+
 
 async def send_photo_with_keyboard(
-message: Message,
-png_bytes: bytes,
-slug: str,
-attrs: NftAttrs,
+    message: Message,
+    png_bytes: bytes,
+    slug: str,
+    attrs: NftAttrs,
 ) -> bool:
-caption, ents = make_caption(slug, attrs)
-kbd           = make_keyboard(slug)
-file          = BufferedInputFile(png_bytes, filename=f”{slug}.png”)
-try:
-await message.answer_photo(
-photo=file,
-caption=caption,
-caption_entities=ents,
-parse_mode=None,
-reply_markup=kbd,
-)
-return True
-except TelegramRetryAfter as e:
-await asyncio.sleep(e.retry_after)
-try:
-file = BufferedInputFile(png_bytes, filename=f”{slug}.png”)
-await message.answer_photo(
-photo=file,
-caption=caption,
-caption_entities=ents,
-parse_mode=None,
-reply_markup=kbd,
-)
-return True
-except Exception as ex:
-logger.error(“Retry failed: %s”, ex)
-return False
-except TelegramBadRequest as e:
-logger.error(“BadRequest: %s”, e)
-return False
-except Exception:
-logger.exception(“send_photo error”)
-return False
+    caption, ents = make_caption(slug, attrs)
+    kbd           = make_keyboard(slug)
+    file          = BufferedInputFile(png_bytes, filename=f"{slug}.png")
+    try:
+        await message.answer_photo(
+            photo=file,
+            caption=caption,
+            caption_entities=ents,
+            parse_mode=None,
+            reply_markup=kbd,
+        )
+        return True
+    except TelegramRetryAfter as e:
+        await asyncio.sleep(e.retry_after)
+        try:
+            file = BufferedInputFile(png_bytes, filename=f"{slug}.png")
+            await message.answer_photo(
+                photo=file,
+                caption=caption,
+                caption_entities=ents,
+                parse_mode=None,
+                reply_markup=kbd,
+            )
+            return True
+        except Exception as ex:
+            logger.error("send_photo | retry failed | error=%s", ex)
+            return False
+    except TelegramBadRequest as e:
+        logger.error("send_photo | BadRequest | error=%s", e)
+        return False
+    except Exception:
+        logger.exception("send_photo | unexpected error")
+        return False
+
 
 async def send_document_only(send_fn, webp_bytes: bytes, slug: str) -> None:
-file = BufferedInputFile(webp_bytes, filename=f”{slug}.png”)
-try:
-await send_fn(document=file)
-except TelegramRetryAfter as e:
-await asyncio.sleep(e.retry_after)
-file = BufferedInputFile(webp_bytes, filename=f”{slug}.png”)
-await send_fn(document=file)
-except Exception as e:
-logger.error(“send_document error: %s”, e)
+    file = BufferedInputFile(webp_bytes, filename=f"{slug}.png")
+    try:
+        await send_fn(document=file)
+    except TelegramRetryAfter as e:
+        await asyncio.sleep(e.retry_after)
+        file = BufferedInputFile(webp_bytes, filename=f"{slug}.png")
+        await send_fn(document=file)
+    except Exception as e:
+        logger.error("send_document | error=%s", e)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-
-# BOT & DISPATCHER
-
+#  BOT & DISPATCHER
 # ══════════════════════════════════════════════════════════════════════════════
 
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
 
-# ── Бот добавлен в группу — приветствие ──────────────────────────────────────
 
+# ── Бот добавлен / удалён из группы ──────────────────────────────────────────
 @dp.my_chat_member()
-async def on_bot_added_to_group(event: ChatMemberUpdated) -> None:
-if event.chat.type not in (“group”, “supergroup”):
-return
+async def on_bot_status_changed(event: ChatMemberUpdated) -> None:
+    if event.chat.type not in ("group", "supergroup"):
+        return
 
-```
-old_status = event.old_chat_member.status
-new_status = event.new_chat_member.status
+    old_status = event.old_chat_member.status
+    new_status = event.new_chat_member.status
 
-was_outside = old_status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED, "left", "kicked")
-now_inside  = new_status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, "member", "administrator")
+    was_outside = old_status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED, "left", "kicked")
+    now_inside  = new_status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, "member", "administrator")
+    now_outside = new_status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED, "left", "kicked")
 
-if was_outside and now_inside:
-    chat_title = event.chat.title or "этот чат"
-    try:
-        await bot.send_message(
-            chat_id=event.chat.id,
-            text=get_group_welcome(chat_title),
-            parse_mode=ParseMode.HTML,
-        )
-        logger.info("✅ Приветствие отправлено в чат: %s (%s)", chat_title, event.chat.id)
-    except TelegramForbiddenError:
-        logger.warning("Нет прав писать в чат %s", event.chat.id)
-    except Exception as e:
-        logger.error("Ошибка отправки приветствия: %s", e)
-```
+    who  = _u(event.from_user)
+    chat = _chat(event.chat)
+
+    if was_outside and now_inside:
+        role = "администратором" if new_status in (ChatMemberStatus.ADMINISTRATOR, "administrator") else "участником"
+        user_log.info("➕ БОТ ДОБАВЛЕН В ГРУППУ | кто=%s | чат=%s | роль=%s", who, chat, role)
+        chat_title = event.chat.title or "этот чат"
+        try:
+            await bot.send_message(
+                chat_id=event.chat.id,
+                text=get_group_welcome(chat_title),
+                parse_mode=ParseMode.HTML,
+            )
+            user_log.info("   └─ приветствие отправлено | chat_id=%s", event.chat.id)
+        except TelegramForbiddenError:
+            logger.warning("on_add | нет прав писать | chat_id=%s", event.chat.id)
+        except Exception as e:
+            logger.error("on_add | ошибка приветствия | error=%s", e)
+
+    elif now_outside:
+        action = "ВЫГНАН/ЗАБАНЕН" if new_status in (ChatMemberStatus.KICKED, "kicked") else "УДАЛЁН"
+        user_log.info("➖ БОТ %s ИЗ ГРУППЫ | кто=%s | чат=%s", action, who, chat)
+
 
 # ── /start ────────────────────────────────────────────────────────────────────
-
 @dp.message(CommandStart())
 async def cmd_start(message: Message) -> None:
-if message.chat.type != “private”:
-return
+    if message.chat.type != "private":
+        return
 
-```
-buttons = []
-if BOT_USERNAME:
-    buttons.append([
-        InlineKeyboardButton(
-            text="➕ Добавить в группу",
-            url=f"https://t.me/{BOT_USERNAME}?startgroup",
-        )
-    ])
+    user_log.info("▶ /start | пользователь=%s", _u(message.from_user))
 
-reply_markup = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
-await message.answer(
-    get_start_text(),
-    parse_mode=ParseMode.HTML,
-    reply_markup=reply_markup,
-)
-```
+    buttons = []
+    if BOT_USERNAME:
+        buttons.append([
+            InlineKeyboardButton(
+                text="➕ Добавить в группу",
+                url=f"https://t.me/{BOT_USERNAME}?startgroup",
+            )
+        ])
+
+    reply_markup = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+    await message.answer(
+        get_start_text(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=reply_markup,
+    )
+
 
 # ── Обработка текста (личка + группа) ────────────────────────────────────────
-
 @dp.message(F.text)
 async def handle_text(message: Message) -> None:
-# Защита от сообщений без отправителя (каналы, системные)
-if not message.from_user:
-return
-
-```
-raw_text = (message.text or "").strip()
-is_private = message.chat.type == "private"
-
-if not is_private:
-    lower = raw_text.lower()
-    if not (lower.startswith("превью") or lower.startswith("preview")):
+    # Сообщения без отправителя (каналы, системные) — игнорируем
+    if not message.from_user:
         return
-    for prefix in ("превью", "preview"):
-        if lower.startswith(prefix):
-            raw_text = raw_text[len(prefix):].strip()
-            break
 
-slug = extract_nft_slug(raw_text)
+    raw_text   = (message.text or "").strip()
+    is_private = message.chat.type == "private"
 
-if not slug:
-    if is_private:
-        await message.answer(
-            f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> '
-            f"<b>Неверный формат.</b>\n\n"
-            f"<b>Примеры:</b>\n"
-            f"<code>t.me/nft/PlushPepe-22</code>\n"
-            f"<code>PlushPepe 22</code>\n"
-            f"<code>Plush Pepe 22</code>",
-            parse_mode=ParseMode.HTML,
+    if not is_private:
+        lower = raw_text.lower()
+        if not (lower.startswith("превью") or lower.startswith("preview")):
+            return
+        for prefix in ("превью", "preview"):
+            if lower.startswith(prefix):
+                raw_text = raw_text[len(prefix):].strip()
+                break
+
+    slug = extract_nft_slug(raw_text)
+
+    # ── Неверный формат ───────────────────────────────────────────────────────
+    if not slug:
+        user_log.info(
+            "❓ НЕВЕРНЫЙ ФОРМАТ | пользователь=%s | чат=%s | текст=%r",
+            _u(message.from_user), _chat(message.chat), (message.text or "")[:80],
         )
+        if is_private:
+            await message.answer(
+                f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> '
+                f"<b>Неверный формат.</b>\n\n"
+                f"<b>Примеры:</b>\n"
+                f"<code>t.me/nft/PlushPepe-22</code>\n"
+                f"<code>PlushPepe 22</code>\n"
+                f"<code>Plush Pepe 22</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await message.answer(
+                f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> '
+                f"<b>Неверный формат подарка.</b>\n\n"
+                f"<b>Примеры:</b>\n"
+                f"<code>превью t.me/nft/PlushPepe-22</code>\n"
+                f"<code>превью PlushPepe 22</code>\n"
+                f"<code>превью Plush Pepe 22</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        return
+
+    user_id = message.from_user.id
+    where   = "личка" if is_private else "группа"
+
+    # ── Логируем запрос ───────────────────────────────────────────────────────
+    user_log.info(
+        "🎁 ЗАПРОС | slug=%s | пользователь=%s | чат=%s | тип=%s",
+        slug, _u(message.from_user), _chat(message.chat), where,
+    )
+
+    # ── Антиспам ──────────────────────────────────────────────────────────────
+    if not is_private:
+        slug_wait = check_slug_antispam(user_id, slug)
+        if slug_wait > 0:
+            mins = slug_wait // 60
+            secs = slug_wait % 60
+            time_str = f"{mins} мин {secs} сек" if mins > 0 else f"{secs} сек"
+            user_log.info(
+                "🚫 АНТИСПАМ (повтор) | slug=%s | пользователь=%s | ждать=%s",
+                slug, _u(message.from_user), time_str,
+            )
+            await message.answer(
+                f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
+                f"<b>Этот подарок уже был показан.</b>\n"
+                f"Повтор доступен через <code>{time_str}</code>.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
     else:
+        wait_sec = check_antispam(user_id)
+        if wait_sec > 0:
+            user_log.info(
+                "🚫 АНТИСПАМ (слишком быстро) | пользователь=%s | ждать=%.1f сек",
+                _u(message.from_user), wait_sec,
+            )
+            await message.answer(
+                f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
+                f"<b>Слишком быстро!</b> Подожди ещё <code>{wait_sec}</code> сек.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+    # ── Загрузка ──────────────────────────────────────────────────────────────
+    t_start  = time.monotonic()
+    wait_msg = await message.answer(
+        f"🔍 Загружаю <b>{slug}</b>…",
+        parse_mode=ParseMode.HTML,
+    )
+
+    found, webp_data, error, attrs = await process_slug(slug)
+    elapsed = round(time.monotonic() - t_start, 2)
+
+    await safe_delete(wait_msg)
+
+    # ── Ошибка загрузки ───────────────────────────────────────────────────────
+    if error:
+        user_log.warning(
+            "⚠️ ОШИБКА ЗАГРУЗКИ | slug=%s | пользователь=%s | ошибка=%s | время=%.2fс",
+            slug, _u(message.from_user), error, elapsed,
+        )
+        await message.answer(
+            f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
+            f"<b>Не удалось загрузить</b>\n\n"
+            f"<code>{slug}</code>\n<i>{error}</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # ── Не найден ─────────────────────────────────────────────────────────────
+    if not found:
+        user_log.info(
+            "❌ НЕ НАЙДЕН | slug=%s | пользователь=%s | время=%.2fс",
+            slug, _u(message.from_user), elapsed,
+        )
         await message.answer(
             f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> '
-            f"<b>Неверный формат подарка.</b>\n\n"
-            f"<b>Примеры:</b>\n"
-            f"<code>превью t.me/nft/PlushPepe-22</code>\n"
-            f"<code>превью PlushPepe 22</code>\n"
-            f"<code>превью Plush Pepe 22</code>",
-            parse_mode=ParseMode.HTML,
-        )
-    return
-
-user_id = message.from_user.id
-
-if not is_private:
-    slug_wait = check_slug_antispam(user_id, slug)
-    if slug_wait > 0:
-        mins = slug_wait // 60
-        secs = slug_wait % 60
-        time_str = f"{mins} мин {secs} сек" if mins > 0 else f"{secs} сек"
-        await message.answer(
-            f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
-            f"<b>Этот подарок уже был показан.</b>\n"
-            f"Повтор доступен через <code>{time_str}</code>.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-else:
-    wait_sec = check_antispam(user_id)
-    if wait_sec > 0:
-        await message.answer(
-            f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
-            f"<b>Слишком быстро!</b> Подожди ещё <code>{wait_sec}</code> сек.",
+            f"<b>Подарок не найден</b>\n"
+            f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
+            f"<code>{slug}</code>\n\n"
+            f"<b>Возможные причины:</b>\n"
+            f"• Такого номера ещё не существует\n"
+            f"• Подарок был сожжён 🔥\n"
+            f"• Опечатка в ссылке / названии",
             parse_mode=ParseMode.HTML,
         )
         return
 
-wait_msg = await message.answer(
-    f"🔍 Загружаю <b>{slug}</b>…",
-    parse_mode=ParseMode.HTML,
-)
-found, webp_data, error, attrs = await process_slug(slug)
-await safe_delete(wait_msg)
+    # ── Успех ─────────────────────────────────────────────────────────────────
+    model_info = attrs.model + (f" ({attrs.model_rarity})" if attrs.model_rarity else "")
+    back_info  = attrs.backdrop + (f" ({attrs.backdrop_rarity})" if attrs.backdrop_rarity else "")
+    sym_info   = attrs.symbol + (f" ({attrs.symbol_rarity})" if attrs.symbol_rarity else "")
 
-if error:
-    await message.answer(
-        f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
-        f"<b>Не удалось загрузить</b>\n\n"
-        f"<code>{slug}</code>\n<i>{error}</i>",
-        parse_mode=ParseMode.HTML,
+    user_log.info(
+        "✅ УСПЕХ | slug=%s | модель=%s | фон=%s | символ=%s | пользователь=%s | время=%.2fс",
+        slug, model_info, back_info, sym_info, _u(message.from_user), elapsed,
     )
-    return
 
-if not found:
-    await message.answer(
-        f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> '
-        f"<b>Подарок не найден</b>\n"
-        f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
-        f"<code>{slug}</code>\n\n"
-        f"<b>Возможные причины:</b>\n"
-        f"• Такого номера ещё не существует\n"
-        f"• Подарок был сожжён 🔥\n"
-        f"• Опечатка в ссылке / названии",
-        parse_mode=ParseMode.HTML,
-    )
-    return
-
-png_data = webp_to_png(webp_data)
-if png_data:
-    success = await send_photo_with_keyboard(message, png_data, slug, attrs)
-    if not success:
+    png_data = webp_to_png(webp_data)
+    if png_data:
+        success = await send_photo_with_keyboard(message, png_data, slug, attrs)
+        if not success:
+            user_log.warning("send_photo упал → шлём документом | slug=%s", slug)
+            await send_document_only(message.answer_document, webp_data, slug)
+    else:
+        user_log.warning("WebP→PNG упал → шлём документом | slug=%s", slug)
         await send_document_only(message.answer_document, webp_data, slug)
-else:
-    await send_document_only(message.answer_document, webp_data, slug)
-```
+
 
 # ── Кнопка «Отправить без сжатия» ────────────────────────────────────────────
-
 @dp.callback_query(F.data.startswith(CB_NO_COMPRESS))
 async def callback_no_compress(callback: CallbackQuery) -> None:
-user_id = callback.from_user.id
-slug    = callback.data[len(CB_NO_COMPRESS):]
+    user_id    = callback.from_user.id
+    slug       = callback.data[len(CB_NO_COMPRESS):]
+    message_id = callback.message.message_id
 
-```
-if _cb_lock.get(user_id):
-    await callback.answer("⏳ Подожди, идёт загрузка…", show_alert=False)
-    return
+    if _cb_lock.get(user_id):
+        user_log.info(
+            "🔒 КНОПКА ЗАБЛОКИРОВАНА (идёт загрузка) | slug=%s | пользователь=%s",
+            slug, _u(callback.from_user),
+        )
+        await callback.answer("⏳ Подожди, идёт загрузка…", show_alert=False)
+        return
 
-wait_sec = check_antispam(user_id)
-if wait_sec > 0:
-    await callback.answer(f"⏳ Подожди {wait_sec} сек.", show_alert=True)
-    return
+    wait_sec = check_antispam(user_id)
+    if wait_sec > 0:
+        user_log.info(
+            "🚫 АНТИСПАМ (кнопка) | slug=%s | пользователь=%s | ждать=%.1f сек",
+            slug, _u(callback.from_user), wait_sec,
+        )
+        await callback.answer(f"⏳ Подожди {wait_sec} сек.", show_alert=True)
+        return
 
-# ИСПРАВЛЕНИЕ #5: ключ теперь по message_id, а не по user_id
-# Разные пользователи могут нажать кнопку на одном и том же превью
-message_id = callback.message.message_id
-no_compress_key = f"{message_id}:{slug.lower()}"
+    # ИСПРАВЛЕНИЕ #5: ключ по message_id — разные люди могут нажать кнопку
+    no_compress_key = f"{message_id}:{slug.lower()}"
 
-if no_compress_key in _used_no_compress:
-    await callback.answer(
-        "❌ Оригинал уже был отправлен для этого превью!",
-        show_alert=True,
-    )
-    return
-
-_cb_lock[user_id] = True
-await callback.answer("⏳ Загружаю оригинал…", show_alert=False)
-
-try:
-    found, webp_data, error = await fetch_nft_image(slug)
-    if error or not found:
-        await callback.message.answer(
-            "❌ Не удалось загрузить" if error else "❌ Подарок не найден"
+    if no_compress_key in _used_no_compress:
+        user_log.info(
+            "🚫 КНОПКА УЖЕ ИСПОЛЬЗОВАНА | slug=%s | msg_id=%s | пользователь=%s",
+            slug, message_id, _u(callback.from_user),
+        )
+        await callback.answer(
+            "❌ Оригинал уже был отправлен для этого превью!",
+            show_alert=True,
         )
         return
 
-    # Помечаем кнопку как использованную (по сообщению, не по пользователю)
-    _used_no_compress.add(no_compress_key)
+    user_log.info(
+        "📤 БЕЗ СЖАТИЯ — ЗАПРОС | slug=%s | пользователь=%s | чат=%s",
+        slug, _u(callback.from_user), _chat(callback.message.chat),
+    )
 
-    # ИСПРАВЛЕНИЕ #4: убираем кнопку с сообщения после нажатия
+    _cb_lock[user_id] = True
+    await callback.answer("⏳ Загружаю оригинал…", show_alert=False)
+
     try:
-        await callback.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass  # если не удалось убрать кнопку — не критично
+        t_start = time.monotonic()
+        found, webp_data, error = await fetch_nft_image(slug)
+        elapsed = round(time.monotonic() - t_start, 2)
 
-    await send_document_only(callback.message.answer_document, webp_data, slug)
-finally:
-    _cb_lock[user_id] = False
-```
+        if error or not found:
+            user_log.warning(
+                "⚠️ БЕЗ СЖАТИЯ — ОШИБКА | slug=%s | причина=%s | время=%.2fс",
+                slug, error or "не найден", elapsed,
+            )
+            await callback.message.answer(
+                "❌ Не удалось загрузить" if error else "❌ Подарок не найден"
+            )
+            return
+
+        _used_no_compress.add(no_compress_key)
+
+        # ИСПРАВЛЕНИЕ #4: убираем кнопку после нажатия
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        await send_document_only(callback.message.answer_document, webp_data, slug)
+
+        user_log.info(
+            "✅ БЕЗ СЖАТИЯ — ОТПРАВЛЕНО | slug=%s | пользователь=%s | время=%.2fс",
+            slug, _u(callback.from_user), elapsed,
+        )
+    finally:
+        _cb_lock[user_id] = False
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-
-# INLINE-РЕЖИМ
-
+#  INLINE-РЕЖИМ
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dp.inline_query()
 async def inline_handler(query: InlineQuery) -> None:
-raw = (query.query or “”).strip()
+    raw = (query.query or "").strip()
 
-```
-if not raw:
-    hint = InlineQueryResultArticle(
-        id="hint",
-        title="🎁 NFT Gift Viewer",
-        description="Введите ссылку или название → PlushPepe-22 / Plush Pepe 22",
-        thumbnail_url="https://nft.fragment.com/gift/PlushPepe-1.webp",
-        input_message_content=InputTextMessageContent(
-            message_text=(
-                f"<b>NFT Gift Viewer</b>\n\n"
-                f"Добавь бота в чат и отправляй ссылки или названия подарков прямо в чат!\n\n"
-                f"<code>t.me/nft/PlushPepe-22</code>\n"
-                f"<code>PlushPepe 22</code>"
+    if not raw:
+        hint = InlineQueryResultArticle(
+            id="hint",
+            title="🎁 NFT Gift Viewer",
+            description="Введите ссылку или название → PlushPepe-22 / Plush Pepe 22",
+            thumbnail_url="https://nft.fragment.com/gift/PlushPepe-1.webp",
+            input_message_content=InputTextMessageContent(
+                message_text=(
+                    f"<b>NFT Gift Viewer</b>\n\n"
+                    f"Добавь бота в чат и отправляй ссылки или названия подарков прямо в чат!\n\n"
+                    f"<code>t.me/nft/PlushPepe-22</code>\n"
+                    f"<code>PlushPepe 22</code>"
+                ),
+                parse_mode=ParseMode.HTML,
             ),
-            parse_mode=ParseMode.HTML,
-        ),
-    )
-    await query.answer(results=[hint], cache_time=60, is_personal=False)
-    return
+        )
+        await query.answer(results=[hint], cache_time=60, is_personal=False)
+        return
 
-slug = extract_nft_slug(raw)
+    slug = extract_nft_slug(raw)
 
-if not slug:
-    err = InlineQueryResultArticle(
-        id="err_format",
-        title="❌ Неверный формат",
-        description="Пример: PlushPepe-22 / Plush Pepe 22 / t.me/nft/...",
-        input_message_content=InputTextMessageContent(
-            message_text=(
-                f"<b>Неверный формат</b>\n\n"
-                f"<code>t.me/nft/PlushPepe-22</code>\n"
-                f"<code>PlushPepe 22</code>"
+    if not slug:
+        user_log.info(
+            "🔍 INLINE — НЕВЕРНЫЙ ФОРМАТ | пользователь=%s | запрос=%r",
+            _u(query.from_user), raw[:60],
+        )
+        err = InlineQueryResultArticle(
+            id="err_format",
+            title="❌ Неверный формат",
+            description="Пример: PlushPepe-22 / Plush Pepe 22 / t.me/nft/...",
+            input_message_content=InputTextMessageContent(
+                message_text=(
+                    f"<b>Неверный формат</b>\n\n"
+                    f"<code>t.me/nft/PlushPepe-22</code>\n"
+                    f"<code>PlushPepe 22</code>"
+                ),
+                parse_mode=ParseMode.HTML,
             ),
-            parse_mode=ParseMode.HTML,
-        ),
+        )
+        await query.answer(results=[err], cache_time=5, is_personal=True)
+        return
+
+    user_log.info(
+        "🔍 INLINE — ЗАПРОС | slug=%s | пользователь=%s",
+        slug, _u(query.from_user),
     )
-    await query.answer(results=[err], cache_time=5, is_personal=True)
-    return
 
-found, webp_data, error, attrs = await process_slug(slug)
-name, number = split_slug(slug)
-nice         = readable_name(name)
-title        = f"🎁 {nice} #{number}"
+    t_start = time.monotonic()
+    found, webp_data, error, attrs = await process_slug(slug)
+    elapsed = round(time.monotonic() - t_start, 2)
 
-if error or not found:
-    description = f"⚠️ {error}" if error else "❌ Подарок не найден"
-    not_found = InlineQueryResultArticle(
-        id=f"nf_{slug}",
+    name, number = split_slug(slug)
+    nice         = readable_name(name)
+    title        = f"🎁 {nice} #{number}"
+
+    if error or not found:
+        reason = error or "не найден"
+        user_log.info(
+            "🔍 INLINE — НЕ НАЙДЕН | slug=%s | причина=%s | время=%.2fс",
+            slug, reason, elapsed,
+        )
+        description = f"⚠️ {error}" if error else "❌ Подарок не найден"
+        not_found = InlineQueryResultArticle(
+            id=f"nf_{slug}",
+            title=title,
+            description=description,
+            input_message_content=InputTextMessageContent(
+                message_text=f"<b>Подарок не найден</b>\n\n<code>{slug}</code>",
+                parse_mode=ParseMode.HTML,
+            ),
+        )
+        await query.answer(results=[not_found], cache_time=10, is_personal=True)
+        return
+
+    user_log.info(
+        "🔍 INLINE — УСПЕХ | slug=%s | модель=%s | пользователь=%s | время=%.2fс",
+        slug, attrs.model, _u(query.from_user), elapsed,
+    )
+
+    caption, ents = make_caption(slug, attrs)
+    kbd = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔗 Открыть в Telegram", url=f"https://t.me/nft/{slug}")
+    ]])
+
+    desc_parts = []
+    if attrs.model    != "—": desc_parts.append(f"🪄 {attrs.model}")
+    if attrs.backdrop != "—": desc_parts.append(f"🎨 {attrs.backdrop}")
+    if attrs.symbol   != "—": desc_parts.append(f"✨ {attrs.symbol}")
+    description = "  ·  ".join(desc_parts) if desc_parts else "NFT Подарок"
+
+    photo_url = FRAGMENT_IMAGE_URL.format(slug=slug)
+
+    result = InlineQueryResultPhoto(
+        id=str(uuid.uuid4()),
+        photo_url=photo_url,
+        thumbnail_url=photo_url,
         title=title,
         description=description,
-        input_message_content=InputTextMessageContent(
-            message_text=f"<b>Подарок не найден</b>\n\n<code>{slug}</code>",
-            parse_mode=ParseMode.HTML,
-        ),
+        caption=caption,
+        caption_entities=ents,
+        parse_mode=None,
+        reply_markup=kbd,
     )
-    await query.answer(results=[not_found], cache_time=10, is_personal=True)
-    return
 
-caption, ents = make_caption(slug, attrs)
-kbd = InlineKeyboardMarkup(inline_keyboard=[[
-    InlineKeyboardButton(text="🔗 Открыть в Telegram", url=f"https://t.me/nft/{slug}")
-]])
+    await query.answer(results=[result], cache_time=60, is_personal=False)
 
-desc_parts = []
-if attrs.model    != "—": desc_parts.append(f"🪄 {attrs.model}")
-if attrs.backdrop != "—": desc_parts.append(f"🎨 {attrs.backdrop}")
-if attrs.symbol   != "—": desc_parts.append(f"✨ {attrs.symbol}")
-description = "  ·  ".join(desc_parts) if desc_parts else "NFT Подарок"
-
-photo_url = FRAGMENT_IMAGE_URL.format(slug=slug)
-
-result = InlineQueryResultPhoto(
-    id=str(uuid.uuid4()),
-    photo_url=photo_url,
-    thumbnail_url=photo_url,
-    title=title,
-    description=description,
-    caption=caption,
-    caption_entities=ents,
-    parse_mode=None,
-    reply_markup=kbd,
-)
-
-await query.answer(results=[result], cache_time=60, is_personal=False)
-```
 
 # ══════════════════════════════════════════════════════════════════════════════
-
-# STARTUP / SHUTDOWN
-
+#  STARTUP / SHUTDOWN
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def on_startup() -> None:
-global BOT_USERNAME
-get_session()
-me = await bot.get_me()
-BOT_USERNAME = me.username or “”
-logger.info(“✅ Bot started: @%s (id=%s)”, me.username, me.id)
-logger.info(“━” * 60)
-logger.info(“ЧЕКЛИСТ:”)
-logger.info(”  1. @BotFather → /setprivacy → @%s → Disable”, me.username)
-logger.info(”     БЕЗ ЭТОГО бот не видит сообщения в группах!”)
-logger.info(”  2. @BotFather → /setjoingroups → @%s → Enable”, me.username)
-logger.info(”  3. @BotFather → /setinline → @%s → placeholder”, me.username)
-logger.info(”  4. В группе дать боту права администратора”)
-logger.info(“━” * 60)
+    global BOT_USERNAME
+    get_session()
+    me = await bot.get_me()
+    BOT_USERNAME = me.username or ""
+
+    logger.info("━" * 60)
+    logger.info("✅ БОТ ЗАПУЩЕН: @%s (id=%s)", me.username, me.id)
+    logger.info("   Лог-файл: %s", os.path.abspath(LOG_FILE))
+    logger.info("━" * 60)
+    logger.info("ЧЕКЛИСТ:")
+    logger.info("  1. @BotFather → /setprivacy → @%s → Disable", me.username)
+    logger.info("     БЕЗ ЭТОГО бот не видит сообщения в группах!")
+    logger.info("  2. @BotFather → /setjoingroups → @%s → Enable", me.username)
+    logger.info("  3. @BotFather → /setinline → @%s → placeholder", me.username)
+    logger.info("  4. В группе дать боту права администратора")
+    logger.info("━" * 60)
+
 
 async def on_shutdown() -> None:
-logger.info(“🛑 Shutting down…”)
-global http_session
-if http_session and not http_session.closed:
-await http_session.close()
-await bot.session.close()
+    logger.info("🛑 БОТ ОСТАНОВЛЕН")
+    global http_session
+    if http_session and not http_session.closed:
+        await http_session.close()
+    await bot.session.close()
+
 
 async def main() -> None:
-dp.startup.register(on_startup)
-dp.shutdown.register(on_shutdown)
-await dp.start_polling(
-bot,
-allowed_updates=[“message”, “callback_query”, “inline_query”, “my_chat_member”],
-)
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
+    await dp.start_polling(
+        bot,
+        allowed_updates=["message", "callback_query", "inline_query", "my_chat_member"],
+    )
 
-if **name** == “**main**”:
-asyncio.run(main())
+
+if __name__ == "__main__":
+    asyncio.run(main())
