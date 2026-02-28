@@ -2,17 +2,19 @@
 Telegram NFT Gift Checker Bot
 Автор: @balfikovich
 
-Возможности:
-  • Личка: /start — инструкция + кнопка «Добавить в чат»
-  • Личка / группа: отправь ссылку или название подарка
-  • Inline-режим: @бот <запрос> — мини-карточка с фото
+ВАЖНО — ДО ЗАПУСКА сделай в @BotFather:
+  1. /setinline  → выбери бота → введи placeholder, например:
+        gift link / @username / model name
+     БЕЗ ЭТОГО inline-режим (@бот запрос) НЕ БУДЕТ РАБОТАТЬ!
+  2. /setjoingroups → Enable  (чтобы бота можно было добавлять в группы)
+  3. /setprivacy → Disable  (чтобы бот видел все сообщения в группе)
 
-Форматы запроса:
-  1. https://t.me/nft/PlushPepe-22
-  2. t.me/nft/PlushPepe-22
-  3. PlushPepe-22
-  4. PlushPepe 22
-  5. Plush Pepe 22
+Форматы запроса (личка И группа):
+  • https://t.me/nft/PlushPepe-22
+  • t.me/nft/PlushPepe-22
+  • PlushPepe-22
+  • PlushPepe 22
+  • Plush Pepe 22
 """
 
 import asyncio
@@ -39,7 +41,6 @@ from aiogram.types import (
     InlineQueryResultArticle,
     InlineQueryResultPhoto,
     InputTextMessageContent,
-    SwitchInlineQueryChosenChat,
 )
 from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
 from dotenv import load_dotenv
@@ -67,22 +68,24 @@ AUTHOR             = "@balfikovich"
 ANTISPAM_SECONDS   = 1.5
 
 # ── Custom Emoji IDs ──────────────────────────────────────────────────────────
-E_GIFT   = "5408829285685291820"   # 🎁
-E_MODEL  = "5408894951440279259"   # 🪄
-E_BACK   = "5411585799990830248"   # 🎨
-E_SYMBOL = "5409189019261103031"   # ✨
-E_LINK   = "5409143419593321597"   # 🔗
-E_WARN   = "5409124594751660992"   # ⚠️
-E_ERR    = "5408930028438188841"   # ❌
-E_START  = "6028495398941759268"   # ✨
+E_GIFT   = "5408829285685291820"
+E_MODEL  = "5408894951440279259"
+E_BACK   = "5411585799990830248"
+E_SYMBOL = "5409189019261103031"
+E_LINK   = "5409143419593321597"
+E_WARN   = "5409124594751660992"
+E_ERR    = "5408930028438188841"
+E_START  = "6028495398941759268"
 
 # ── Антиспам ──────────────────────────────────────────────────────────────────
 _last_request: dict[int, float] = {}
 _cb_lock: dict[int, bool] = {}
 
+# ── Имя бота (заполняется при старте) ────────────────────────────────────────
+BOT_USERNAME: str = ""
+
 
 def check_antispam(user_id: int) -> float:
-    """Возвращает 0 если можно, иначе — сколько секунд ждать."""
     now  = time.monotonic()
     last = _last_request.get(user_id, 0.0)
     diff = now - last
@@ -128,8 +131,6 @@ _RE_WORDS = re.compile(
 
 def extract_nft_slug(raw: str) -> Optional[str]:
     """
-    Пробует извлечь slug из произвольного текста.
-
     Поддерживаемые форматы:
       https://t.me/nft/PlushPepe-22
       t.me/nft/PlushPepe-22
@@ -139,17 +140,14 @@ def extract_nft_slug(raw: str) -> Optional[str]:
     """
     text = raw.strip()
 
-    # Формат 1: ссылка
     m = _RE_LINK.search(text)
     if m:
         return m.group(1)
 
-    # Формат 2: slug с дефисом
     m = _RE_SLUG.match(text)
     if m:
         return f"{m.group(1)}-{m.group(2)}"
 
-    # Формат 3: слова + число (убираем пробелы внутри имени)
     m = _RE_WORDS.match(text)
     if m:
         name   = m.group(1).replace(" ", "")
@@ -165,7 +163,6 @@ def split_slug(slug: str) -> tuple[str, str]:
 
 
 def readable_name(raw: str) -> str:
-    """CamelCase → «Camel Case»."""
     s = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", raw)
     return re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", s)
 
@@ -200,7 +197,6 @@ def _set_attr(attrs: NftAttrs, label: str, value: str, rarity: str) -> None:
 
 
 async def fetch_nft_attrs(slug: str) -> NftAttrs:
-    """Парсит атрибуты со страницы t.me/nft/{slug}."""
     attrs   = NftAttrs()
     url     = f"https://t.me/nft/{slug}"
     headers = {
@@ -226,7 +222,6 @@ async def fetch_nft_attrs(slug: str) -> NftAttrs:
 
         soup = BeautifulSoup(html, "lxml")
 
-        # Метод 1: таблица <tr><td>
         for row in soup.select("tr"):
             cells = row.find_all("td")
             if len(cells) < 2:
@@ -240,7 +235,6 @@ async def fetch_nft_attrs(slug: str) -> NftAttrs:
             value = value_cell.get_text(strip=True)
             _set_attr(attrs, label, value, rarity)
 
-        # Метод 2: data-trait
         if attrs.model == "—":
             for el in soup.find_all(attrs={"data-trait": True}):
                 _set_attr(attrs,
@@ -248,7 +242,6 @@ async def fetch_nft_attrs(slug: str) -> NftAttrs:
                           str(el.get("data-value", el.get_text(strip=True))),
                           str(el.get("data-rarity", "")))
 
-        # Метод 3: dl/dt/dd
         if attrs.model == "—":
             for dt in soup.find_all("dt"):
                 dd = dt.find_next_sibling("dd")
@@ -259,7 +252,6 @@ async def fetch_nft_attrs(slug: str) -> NftAttrs:
                         rs.decompose()
                     _set_attr(attrs, dt.get_text(strip=True), dd.get_text(strip=True), r)
 
-        # Метод 4: og:description
         if attrs.model == "—":
             meta = soup.find("meta", attrs={"property": "og:description"})
             if meta:
@@ -275,7 +267,6 @@ async def fetch_nft_attrs(slug: str) -> NftAttrs:
                         k, _, v = part.strip().partition(":")
                         _set_attr(attrs, k.strip(), v.strip(), "")
 
-        # Метод 5: построчный текст
         if attrs.model == "—":
             for line in soup.get_text(separator="\n").splitlines():
                 if ":" in line:
@@ -293,7 +284,6 @@ async def fetch_nft_attrs(slug: str) -> NftAttrs:
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def fetch_nft_image(slug: str) -> tuple:
-    """Возвращает (found: bool, data: bytes | None, error: str | None)."""
     url = FRAGMENT_IMAGE_URL.format(slug=slug)
     try:
         async with get_session().get(url) as resp:
@@ -324,7 +314,7 @@ def webp_to_png(webp_bytes: bytes) -> Optional[bytes]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CAPTION через entities (без parse_mode)
+#  CAPTION через entities
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _utf16_len(s: str) -> int:
@@ -336,7 +326,6 @@ def _utf16_offset(text_so_far: str) -> int:
 
 
 def make_caption(slug: str, attrs: NftAttrs) -> tuple[str, list[MessageEntity]]:
-    """Возвращает (plain_text, caption_entities)."""
     name, number = split_slug(slug)
     nice = readable_name(name)
 
@@ -348,7 +337,7 @@ def make_caption(slug: str, attrs: NftAttrs) -> tuple[str, list[MessageEntity]]:
     entities: list[MessageEntity] = []
     t = ""
 
-    def add_custom_emoji(emoji_char: str, emoji_id: str) -> None:
+    def ce(emoji_char: str, emoji_id: str) -> None:
         nonlocal t
         entities.append(MessageEntity(
             type="custom_emoji",
@@ -358,74 +347,32 @@ def make_caption(slug: str, attrs: NftAttrs) -> tuple[str, list[MessageEntity]]:
         ))
         t += emoji_char
 
-    def add_bold(s: str) -> None:
+    def bold(s: str) -> None:
         nonlocal t
-        entities.append(MessageEntity(
-            type="bold",
-            offset=_utf16_offset(t),
-            length=_utf16_len(s),
-        ))
+        entities.append(MessageEntity(type="bold", offset=_utf16_offset(t), length=_utf16_len(s)))
         t += s
 
-    def add_code(s: str) -> None:
+    def code(s: str) -> None:
         nonlocal t
-        entities.append(MessageEntity(
-            type="code",
-            offset=_utf16_offset(t),
-            length=_utf16_len(s),
-        ))
+        entities.append(MessageEntity(type="code", offset=_utf16_offset(t), length=_utf16_len(s)))
         t += s
 
-    def add_text_link(s: str, url: str) -> None:
+    def link(s: str, url: str) -> None:
         nonlocal t
-        entities.append(MessageEntity(
-            type="text_link",
-            offset=_utf16_offset(t),
-            length=_utf16_len(s),
-            url=url,
-        ))
+        entities.append(MessageEntity(type="text_link", offset=_utf16_offset(t), length=_utf16_len(s), url=url))
         t += s
 
-    def plain(s: str) -> None:
+    def p(s: str) -> None:
         nonlocal t
         t += s
 
-    # 🎁 Neko Helmet #2279
-    add_custom_emoji("🎁", E_GIFT)
-    plain(" ")
-    add_bold(f"{nice} #{number}")
-    plain("\n")
-
-    # ━━━━━━━━━━━━━━━━━━━━
-    add_code(SEP)
-    plain("\n")
-
-    # 🪄 Модель
-    add_custom_emoji("🪄", E_MODEL)
-    plain(" ")
-    add_bold("Модель:")
-    plain(f" {attrs.model}{r_model}\n")
-
-    # 🎨 Фон
-    add_custom_emoji("🎨", E_BACK)
-    plain(" ")
-    add_bold("Фон:")
-    plain(f" {attrs.backdrop}{r_back}\n")
-
-    # ✨ Символ
-    add_custom_emoji("✨", E_SYMBOL)
-    plain(" ")
-    add_bold("Символ:")
-    plain(f" {attrs.symbol}{r_sym}\n")
-
-    # ━━━━━━━━━━━━━━━━━━━━
-    add_code(SEP)
-    plain("\n")
-
-    # 🔗 Открыть в Telegram
-    add_custom_emoji("🔗", E_LINK)
-    plain(" ")
-    add_text_link("Открыть в Telegram", f"https://t.me/nft/{slug}")
+    ce("🎁", E_GIFT);  p(" "); bold(f"{nice} #{number}"); p("\n")
+    code(SEP);          p("\n")
+    ce("🪄", E_MODEL); p(" "); bold("Модель:");  p(f" {attrs.model}{r_model}\n")
+    ce("🎨", E_BACK);  p(" "); bold("Фон:");     p(f" {attrs.backdrop}{r_back}\n")
+    ce("✨", E_SYMBOL); p(" "); bold("Символ:");  p(f" {attrs.symbol}{r_sym}\n")
+    code(SEP);          p("\n")
+    ce("🔗", E_LINK);  p(" "); link("Открыть в Telegram", f"https://t.me/nft/{slug}")
 
     return t, entities
 
@@ -450,36 +397,21 @@ async def safe_delete(msg: Message) -> None:
         pass
 
 
-async def send_photo_with_keyboard(
-    message: Message,
-    png_bytes: bytes,
-    slug: str,
-    attrs: NftAttrs,
-) -> bool:
-    file          = BufferedInputFile(png_bytes, filename=f"{slug}.png")
+async def send_photo_with_keyboard(message: Message, png_bytes: bytes, slug: str, attrs: NftAttrs) -> bool:
     caption, ents = make_caption(slug, attrs)
     kbd           = make_keyboard(slug)
+    file          = BufferedInputFile(png_bytes, filename=f"{slug}.png")
     try:
-        await message.answer_photo(
-            photo=file,
-            caption=caption,
-            caption_entities=ents,
-            reply_markup=kbd,
-        )
+        await message.answer_photo(photo=file, caption=caption, caption_entities=ents, reply_markup=kbd)
         return True
     except TelegramRetryAfter as e:
         await asyncio.sleep(e.retry_after)
         try:
             file = BufferedInputFile(png_bytes, filename=f"{slug}.png")
-            await message.answer_photo(
-                photo=file,
-                caption=caption,
-                caption_entities=ents,
-                reply_markup=kbd,
-            )
+            await message.answer_photo(photo=file, caption=caption, caption_entities=ents, reply_markup=kbd)
             return True
-        except Exception as e2:
-            logger.error("Retry failed: %s", e2)
+        except Exception as ex:
+            logger.error("Retry failed: %s", ex)
             return False
     except TelegramBadRequest as e:
         logger.error("BadRequest: %s", e)
@@ -502,6 +434,22 @@ async def send_document_only(send_fn, webp_bytes: bytes, slug: str) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  ОБЩАЯ ЛОГИКА ОБРАБОТКИ ЗАПРОСА (используется и в личке/группе, и в inline)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def process_slug(slug: str) -> tuple:
+    """
+    Загружает фото + атрибуты параллельно.
+    Возвращает (found, webp_data, error, attrs).
+    """
+    (found, webp_data, error), attrs = await asyncio.gather(
+        fetch_nft_image(slug),
+        fetch_nft_attrs(slug),
+    )
+    return found, webp_data, error, attrs
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  BOT & DISPATCHER
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -518,51 +466,45 @@ async def cmd_start(message: Message) -> None:
         f'<tg-emoji emoji-id="{E_START}">✨</tg-emoji> <b>NFT Gift Viewer</b>\n'
         f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
         f"Показываю картинку, модель, фон, символ и редкость любого Telegram NFT-подарка.\n\n"
-        f"<b>📨 Как использовать в личке:</b>\n"
-        f"Просто отправь ссылку или название подарка.\n\n"
+        f"<b>📨 Как пользоваться:</b>\n"
+        f"Отправь ссылку или название подарка — и я пришлю карточку.\n\n"
         f"<b>✅ Поддерживаемые форматы:</b>\n"
         f"<code>https://t.me/nft/PlushPepe-22</code>\n"
         f"<code>t.me/nft/PlushPepe-22</code>\n"
         f"<code>PlushPepe-22</code>\n"
         f"<code>PlushPepe 22</code>\n"
         f"<code>Plush Pepe 22</code>\n\n"
-        f"<b>👥 Использование в группе / чате:</b>\n"
-        f"Напечатай <code>@бот</code> и через пробел ссылку или название — "
-        f"появится карточка с фото подарка. Нажми на неё — "
-        f"и результат будет отправлен прямо в чат!\n\n"
+        f"<b>👥 В группе / чате:</b>\n"
+        f"Напечатай <code>@{BOT_USERNAME or 'бот'} PlushPepe 22</code> — "
+        f"появится карточка с фото. Нажми на неё — результат отправится в чат!\n\n"
         f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
-        f"⚡ Проверка занимает ~1–2 сек\n\n"
+        f"⚡ Проверка ~1–2 сек\n\n"
         f"<i>Автор: <a href='https://t.me/balfikovich'>{AUTHOR}</a></i>"
     )
 
-    # Кнопка «Добавить бота в чат» — только в личке
-    reply_markup = None
-    if is_private:
-        reply_markup = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
-                text="➕ Добавить бота в чат",
-                # Открывает список чатов; после выбора вставляет @botname в поле ввода
-                switch_inline_query_chosen_chat=SwitchInlineQueryChosenChat(
-                    query="",
-                    allow_group_chats=True,
-                    allow_channel_chats=False,
-                    allow_bot_chats=False,
-                    allow_user_chats=False,
-                ),
-            )
-        ]])
+    buttons = []
 
+    if is_private:
+        # Кнопка добавления в группу через startgroup deep link
+        # При нажатии открывается стандартный диалог выбора группы Telegram,
+        # где показываются только чаты где у пользователя есть права администратора.
+        add_url = f"https://t.me/{BOT_USERNAME}?startgroup=start" if BOT_USERNAME else None
+        if add_url:
+            buttons.append([
+                InlineKeyboardButton(text="➕ Добавить бота в группу", url=add_url)
+            ])
+
+    reply_markup = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
 
 
-# ── Обработка текстового сообщения ────────────────────────────────────────────
+# ── Обработка текста (личка + группа) ────────────────────────────────────────
 @dp.message(F.text)
 async def handle_text(message: Message) -> None:
     raw_text = (message.text or "").strip()
     slug = extract_nft_slug(raw_text)
 
     if not slug:
-        # В группах бот молчит на сообщения без slug, чтобы не мусорить
         if message.chat.type == "private":
             await message.answer(
                 f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> '
@@ -586,16 +528,8 @@ async def handle_text(message: Message) -> None:
         )
         return
 
-    wait_msg = await message.answer(
-        f"🔍 Загружаю <b>{slug}</b>…",
-        parse_mode=ParseMode.HTML,
-    )
-
-    (found, webp_data, error), attrs = await asyncio.gather(
-        fetch_nft_image(slug),
-        fetch_nft_attrs(slug),
-    )
-
+    wait_msg = await message.answer(f"🔍 Загружаю <b>{slug}</b>…", parse_mode=ParseMode.HTML)
+    found, webp_data, error, attrs = await process_slug(slug)
     await safe_delete(wait_msg)
 
     if error:
@@ -650,12 +584,9 @@ async def callback_no_compress(callback: CallbackQuery) -> None:
 
     try:
         found, webp_data, error = await fetch_nft_image(slug)
-
         if error or not found:
-            msg = "❌ Не удалось загрузить" if error else "❌ Подарок не найден"
-            await callback.message.answer(msg)
+            await callback.message.answer("❌ Не удалось загрузить" if error else "❌ Подарок не найден")
             return
-
         await send_document_only(callback.message.answer_document, webp_data, slug)
     finally:
         _cb_lock[user_id] = False
@@ -663,20 +594,21 @@ async def callback_no_compress(callback: CallbackQuery) -> None:
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  INLINE-РЕЖИМ
+#
+#  КАК ЭТО РАБОТАЕТ:
+#  Пользователь в любом чате набирает @botusername <запрос>
+#  Telegram отправляет боту InlineQuery с этим запросом.
+#  Бот отвечает списком результатов (фото / статья).
+#  Пользователь нажимает — результат отправляется в чат.
+#
+#  ТРЕБОВАНИЕ: в @BotFather обязательно /setinline для этого бота!
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dp.inline_query()
 async def inline_handler(query: InlineQuery) -> None:
-    """
-    Обрабатывает запросы вида @бот <ссылка_или_название>.
-
-    • Пустой запрос → карточка-подсказка с инструкцией
-    • Нераспознанный формат → карточка с примерами
-    • Подарок найден → фото-карточка, при нажатии отправляет в чат
-    """
     raw = (query.query or "").strip()
 
-    # ── Пустой запрос: подсказка ──────────────────────────────────────────
+    # ── Пустой запрос: показываем подсказку ──────────────────────────────
     if not raw:
         hint = InlineQueryResultArticle(
             id="hint",
@@ -689,13 +621,12 @@ async def inline_handler(query: InlineQuery) -> None:
                     f"<b>NFT Gift Viewer</b>\n\n"
                     f"Отправь ссылку или название подарка:\n"
                     f"<code>t.me/nft/PlushPepe-22</code>\n"
-                    f"<code>PlushPepe 22</code>\n"
-                    f"<code>Plush Pepe 22</code>"
+                    f"<code>PlushPepe 22</code>"
                 ),
                 parse_mode=ParseMode.HTML,
             ),
         )
-        await query.answer(results=[hint], cache_time=300, is_personal=False)
+        await query.answer(results=[hint], cache_time=60, is_personal=False)
         return
 
     slug = extract_nft_slug(raw)
@@ -722,10 +653,7 @@ async def inline_handler(query: InlineQuery) -> None:
         return
 
     # ── Загружаем фото и атрибуты параллельно ────────────────────────────
-    (found, webp_data, error), attrs = await asyncio.gather(
-        fetch_nft_image(slug),
-        fetch_nft_attrs(slug),
-    )
+    found, webp_data, error, attrs = await process_slug(slug)
 
     name, number = split_slug(slug)
     nice         = readable_name(name)
@@ -750,24 +678,20 @@ async def inline_handler(query: InlineQuery) -> None:
         await query.answer(results=[not_found], cache_time=10, is_personal=True)
         return
 
-    # ── Формируем caption и кнопку ────────────────────────────────────────
+    # ── Собираем результат ────────────────────────────────────────────────
     caption, ents = make_caption(slug, attrs)
 
     kbd = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(
-            text="🔗 Открыть в Telegram",
-            url=f"https://t.me/nft/{slug}",
-        )
+        InlineKeyboardButton(text="🔗 Открыть в Telegram", url=f"https://t.me/nft/{slug}")
     ]])
 
-    # Описание для карточки предпросмотра
     desc_parts = []
     if attrs.model    != "—": desc_parts.append(f"🪄 {attrs.model}")
     if attrs.backdrop != "—": desc_parts.append(f"🎨 {attrs.backdrop}")
     if attrs.symbol   != "—": desc_parts.append(f"✨ {attrs.symbol}")
     description = "  ·  ".join(desc_parts) if desc_parts else "NFT Подарок"
 
-    # fragment.com отдаёт webp — Telegram принимает его в inline-режиме
+    # fragment.com отдаёт webp — Telegram принимает его как photo_url в inline
     photo_url = FRAGMENT_IMAGE_URL.format(slug=slug)
 
     result = InlineQueryResultPhoto(
@@ -789,13 +713,20 @@ async def inline_handler(query: InlineQuery) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def on_startup() -> None:
+    global BOT_USERNAME
     get_session()
     me = await bot.get_me()
+    BOT_USERNAME = me.username or ""
     logger.info("✅ Bot started: @%s (id=%s)", me.username, me.id)
-    logger.info(
-        "   ⚠️  Убедись что в @BotFather включён Inline Mode: "
-        "Bot Settings → Inline Mode → Enable"
-    )
+    logger.info("━" * 60)
+    logger.info("ЧЕКЛИСТ (если что-то не работает):")
+    logger.info("  1. @BotFather → /setinline → @%s → введи placeholder", me.username)
+    logger.info("     например: gift link / @username / model name")
+    logger.info("     БЕЗ ЭТОГО inline (@бот запрос) НЕ РАБОТАЕТ!")
+    logger.info("  2. @BotFather → /setjoingroups → @%s → Enable", me.username)
+    logger.info("  3. @BotFather → /setprivacy → @%s → Disable", me.username)
+    logger.info("     (чтобы бот видел сообщения в группе, не только команды)")
+    logger.info("━" * 60)
 
 
 async def on_shutdown() -> None:
