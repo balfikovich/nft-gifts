@@ -489,7 +489,7 @@ def tgs_to_mp4(tgs_bytes: bytes, size: int = 512) -> Optional[bytes]:
             bg.save(os.path.join(frames_dir, f"frame_{i:05d}.png"),
                     format="PNG", compress_level=0)
 
-        # ffmpeg: PNG → MP4, максимальное качество + скорость
+        # ffmpeg: PNG → MP4, максимальная совместимость + хорошее качество
         import multiprocessing
         cpu_count = multiprocessing.cpu_count()
 
@@ -499,11 +499,12 @@ def tgs_to_mp4(tgs_bytes: bytes, size: int = 512) -> Optional[bytes]:
             "-framerate", str(fps),
             "-i", os.path.join(frames_dir, "frame_%05d.png"),
             "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",        # совместимость с Telegram
-            "-crf", "0",                  # lossless — нулевые потери качества
-            "-preset", "fast",            # быстро + lossless = идеально
+            "-pix_fmt", "yuv420p",        # максимальная совместимость (Android, iOS, все)
+            "-crf", "15",                 # высокое качество без потерь совместимости
+            "-preset", "fast",            # быстрая конвертация
             "-tune", "animation",         # оптимизация под анимацию
-            "-x264-params", "ref=1:me=dia:subme=1:trellis=0:weightp=0",  # ускорение энкодера
+            "-profile:v", "baseline",     # baseline profile — работает на ВСЕХ Android
+            "-level", "3.1",              # уровень совместимости
             "-movflags", "+faststart",    # быстрый старт воспроизведения
             mp4_path,
         ]
