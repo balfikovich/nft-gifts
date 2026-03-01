@@ -703,148 +703,144 @@ def format_progress_bar(current: int, total: int, width: int = 20) -> str:
     return f"[{bar}] {current}/{total} ({int(pct * 100)}%)"
 
 
-async def fetch_user_gifts(bot_instance: Bot, user_id: int) -> list[str]:
+async def fetch_user_gifts(bot_instance: Bot, user_id: int) -> tuple[list[str], list[str]]:
     """
-    Получает список NFT-подарков пользователя.
+    Получает список NFT-подарков пользователя через прямой вызов Bot API.
 
-    Telegram Bot API метод getUserGifts возвращает SavedGift объекты.
-    Структура SavedGift:
-      - gift: Gift
-          - id: str  — уникальный идентификатор подарка (это НЕ slug для fragment!)
-          - sticker: Sticker  — TGS стикер самого подарка
-          - star_count: int
-          - total_count: int  — сколько таких подарков выпущено
-          - remaining_count: int
-      - owned_gift_id: str  — уникальный id этого конкретного экземпляра у юзера
-      - sender_user: User (опционально)
-      - send_date: int
-      - is_saved: bool
-      - was_refunded: bool
+    Используем прямой HTTP запрос к Bot API (не через aiogram обёртку),
+    чтобы не зависеть от версии aiogram — метод getUserGifts есть в Bot API 8.3+.
 
-    Нам нужен SLUG для fragment.com — это gift.id (например "PlushPepe-22").
-    Но gift.id в API — это числовой id типа подарка, НЕ slug!
-    Slug определяем через sticker.set_name (имя стикерсета = slug на fragment).
-    
+    Возвращает (slugs, file_ids):
+      - slugs: список slug-ов вида "PlushPepe-22" (для скачивания TGS с fragment)
+      - file_ids: fallback — file_id TGS стикеров если slug не определился
+
+    Slug берём из gift.sticker.set_name — это имя стикерсета = slug на fragment.com.
     ВАЖНО: список подарков пользователя должен быть публичным.
     """
-    slugs = []
-    tgs_file_ids = []  # fallback: собираем file_id стикеров
+    slugs: list[str] = []
+    tgs_file_ids: list[str] = []
+
+    token = bot_instance.token
+    base_url = f"https://api.telegram.org/bot{token}/getUserGifts"
+
+    offset = None
+    while len(slugs) + len(tgs_file_ids) < 100:
+        params: dict = {"user_id": user_id, "limit": 100}
+        if offset:
+            params["offset"] = offset
+
+        try:
+            async with get_session().get(base_url, params=params) as resp:
+                raw = await resp.json()
+        except Exception as e:
+            logger.error("fetch_user_gifts HTTP error: %s", e)
+            raise ValueError(f"API_ERROR:HTTP error: {e}")
+
+        # Проверяем ответ
+        if not raw.get("ok"):
+            err_desc = raw.get("description", "unknown error")
+            err_code = raw.get("error_code", 0)
+            logger.error("fetch_user_gifts API error %s: %s", err_code, err_desc)
+
+            err_lower = err_desc.lower()
+            if any(x in err_lower for x in ["privacy", "restricted", "not visible",
+                                              "user_restricted", "gift_list"]):
+                raise ValueError("PRIVATE")
+            raise ValueError(f"API_ERROR:{err_desc}")
+
+        result = raw.get("result", {})
+
+        # result может быть dict с полем gifts или сразу list
+        if isinstance(result, dict):
+            gifts_list = result.get("gifts", result.get("saved_gifts", []))
+            next_offset = result.get("next_offset")
+        elif isinstance(result, list):
+            gifts_list = result
+            next_offset = None
+        else:
+            break
+
+        if not gifts_list:
+            break
+
+        logger.info("fetch_user_gifts: страница %d подарков (offset=%s)",
+                    len(gifts_list), offset)
+
+        for item in gifts_list:
+            if len(slugs) + len(tgs_file_ids) >= 100:
+                break
+            if not isinstance(item, dict):
+                continue
+
+            slug = _extract_slug_from_gift_dict(item)
+            if slug:
+                slugs.append(slug)
+            else:
+                fid = _extract_file_id_from_gift_dict(item)
+                if fid:
+                    tgs_file_ids.append(fid)
+                logger.debug("fetch_user_gifts: slug не определён для %s",
+                             item.get("owned_gift_id", "?"))
+
+        if not next_offset or next_offset == offset:
+            break
+        offset = next_offset
+
+    logger.info("fetch_user_gifts ИТОГО: slugs=%d, file_ids=%d", len(slugs), len(tgs_file_ids))
+    return slugs, tgs_file_ids
+
+
+def _extract_slug_from_gift_dict(item: dict) -> Optional[str]:
+    """
+    Извлекает slug (PlushPepe-22) из словаря SavedGift (raw Bot API JSON).
+
+    Порядок приоритетов:
+    1. gift.sticker.set_name  — имя стикерсета = slug на fragment.com (самый надёжный)
+    2. slug                   — некоторые версии API возвращают его напрямую
+    3. gift.id в строковом виде похожем на slug
+    """
+    _SLUG_RE = re.compile(r'^[A-Za-z][A-Za-z0-9]*(?:[A-Z][a-z0-9]*)*-\d+$')
 
     try:
-        # aiogram метод: bot.get_user_gifts(user_id, offset, limit)
-        # Пагинация: limit=100 за раз
-        offset = None
-        while len(slugs) < 100:
-            kwargs: dict = {"user_id": user_id, "limit": 100}
-            if offset:
-                kwargs["offset"] = offset
+        gift = item.get("gift", {})
+        if not isinstance(gift, dict):
+            return None
 
-            result = await bot_instance.get_user_gifts(**kwargs)
+        # Способ 1: gift.sticker.set_name
+        sticker = gift.get("sticker", {})
+        if isinstance(sticker, dict):
+            set_name = sticker.get("set_name", "")
+            if set_name and _SLUG_RE.match(str(set_name)):
+                return str(set_name)
 
-            gifts_raw = None
-            # Разные версии aiogram могут отдавать по-разному
-            if hasattr(result, "gifts"):
-                gifts_raw = result.gifts
-            elif hasattr(result, "saved_gifts"):
-                gifts_raw = result.saved_gifts
-            elif isinstance(result, (list, tuple)):
-                gifts_raw = list(result)
-            
-            if not gifts_raw:
-                break
+        # Способ 2: прямое поле slug (некоторые версии API)
+        direct_slug = item.get("slug") or gift.get("slug")
+        if direct_slug and _SLUG_RE.match(str(direct_slug)):
+            return str(direct_slug)
 
-            logger.info("fetch_user_gifts: получено %d подарков (offset=%s)", len(gifts_raw), offset)
+        # Способ 3: gift.id если похож на slug
+        gift_id = str(gift.get("id", ""))
+        if gift_id and _SLUG_RE.match(gift_id):
+            return gift_id
 
-            for item in gifts_raw:
-                if len(slugs) >= 100:
-                    break
+        # Способ 4: owned_gift_id
+        owned_id = str(item.get("owned_gift_id", ""))
+        if owned_id and _SLUG_RE.match(owned_id):
+            return owned_id
 
-                # Пробуем достать slug разными способами
-                slug = _extract_slug_from_saved_gift(item)
-                if slug:
-                    slugs.append(slug)
-                else:
-                    # Fallback: сохраняем file_id стикера чтобы добавить его напрямую
-                    fid = _extract_sticker_file_id(item)
-                    if fid:
-                        tgs_file_ids.append(fid)
-                    logger.debug("fetch_user_gifts: не удалось извлечь slug из %r", item)
-
-            # Проверяем есть ли ещё страницы
-            next_offset = getattr(result, "next_offset", None)
-            if not next_offset or next_offset == offset:
-                break
-            offset = next_offset
-
-    except TelegramBadRequest as e:
-        err_str = str(e).lower()
-        if any(x in err_str for x in ["privacy", "restricted", "not visible", "forbidden"]):
-            raise ValueError("PRIVATE")
-        logger.error("fetch_user_gifts TelegramBadRequest: %s", e)
-        raise ValueError(f"API_ERROR:{e}")
     except Exception as e:
-        logger.error("fetch_user_gifts unexpected: %s", e, exc_info=True)
-        raise ValueError(f"API_ERROR:{e}")
-
-    logger.info("fetch_user_gifts ИТОГО: slugs=%d, file_ids_fallback=%d", len(slugs), len(tgs_file_ids))
-    return slugs, tgs_file_ids  # возвращаем оба списка
-
-
-def _extract_slug_from_saved_gift(item) -> Optional[str]:
-    """
-    Пытается извлечь slug (PlushPepe-22) из объекта SavedGift.
-    Telegram Bot API 8.x: SavedGift.gift.sticker.set_name — это и есть slug на fragment.
-    """
-    try:
-        # Способ 1: через sticker.set_name (самый надёжный)
-        gift_obj = getattr(item, "gift", None)
-        if gift_obj:
-            sticker = getattr(gift_obj, "sticker", None)
-            if sticker:
-                set_name = getattr(sticker, "set_name", None)
-                if set_name and re.match(r'^[A-Za-z].*-\d+$', str(set_name)):
-                    return str(set_name)
-
-        # Способ 2: owned_gift_id иногда содержит slug
-        owned_id = getattr(item, "owned_gift_id", None)
-        if owned_id and re.match(r'^[A-Za-z].*-\d+$', str(owned_id)):
-            return str(owned_id)
-
-        # Способ 3: gift.id — числовой id типа подарка, не slug
-        # Но попробуем если он похож на slug
-        if gift_obj:
-            gift_id = getattr(gift_obj, "id", None)
-            if gift_id and re.match(r'^[A-Za-z].*-\d+$', str(gift_id)):
-                return str(gift_id)
-
-        # Способ 4: если item сам является словарём (raw data)
-        if isinstance(item, dict):
-            gift_d = item.get("gift", {})
-            if isinstance(gift_d, dict):
-                st = gift_d.get("sticker", {})
-                if isinstance(st, dict):
-                    sn = st.get("set_name", "")
-                    if sn and re.match(r'^[A-Za-z].*-\d+$', sn):
-                        return sn
-    except Exception as e:
-        logger.debug("_extract_slug_from_saved_gift error: %s", e)
+        logger.debug("_extract_slug_from_gift_dict error: %s", e)
     return None
 
 
-def _extract_sticker_file_id(item) -> Optional[str]:
-    """Извлекает file_id TGS стикера из SavedGift."""
+def _extract_file_id_from_gift_dict(item: dict) -> Optional[str]:
+    """Извлекает file_id TGS стикера из словаря SavedGift."""
     try:
-        gift_obj = getattr(item, "gift", None)
-        if gift_obj:
-            sticker = getattr(gift_obj, "sticker", None)
-            if sticker:
-                return getattr(sticker, "file_id", None)
-        if isinstance(item, dict):
-            gift_d = item.get("gift", {})
-            if isinstance(gift_d, dict):
-                st = gift_d.get("sticker", {})
-                if isinstance(st, dict):
-                    return st.get("file_id")
+        gift = item.get("gift", {})
+        if isinstance(gift, dict):
+            sticker = gift.get("sticker", {})
+            if isinstance(sticker, dict):
+                return sticker.get("file_id")
     except Exception:
         pass
     return None
@@ -906,32 +902,26 @@ async def create_sticker_pack(
 
     # ── Создаём стикерпак с первым стикером ──────────────────────────────────
     await _edit_progress(progress_msg, pack_type, 0, total, "🎨 Создаю стикерпак…")
-    try:
-        await bot.create_new_sticker_set(
-            user_id=user_id,
-            name=pack_name,
-            title=pack_title,
-            stickers=[first_sticker],
-        )
-        logger.info("Стикерпак создан: %s", pack_name)
-    except TelegramBadRequest as e:
-        e_str = str(e).lower()
-        if "already occupied" in e_str or "name is occupied" in e_str or "invalid" in e_str:
-            logger.warning("create_sticker_pack: пак уже существует, продолжаем (%s)", e)
-        else:
-            logger.error("create_sticker_pack error: %s", e)
-            await progress_msg.edit_text(
-                f"❌ <b>Ошибка создания стикерпака:</b>\n<code>{e}</code>",
-                parse_mode=ParseMode.HTML,
-            )
-            return None
-    except Exception as e:
-        logger.error("create_sticker_pack unexpected: %s", e)
-        await progress_msg.edit_text(
-            f"❌ <b>Неожиданная ошибка:</b>\n<code>{e}</code>",
-            parse_mode=ParseMode.HTML,
-        )
-        return None
+
+    first_tgs_data: Optional[bytes] = None
+    first_slug_fn = first_slug or "sticker"
+
+    # Достаём bytes из первого стикера для HTTP отправки
+    if first_slug and slugs:
+        ok2, first_tgs_data, _ = await fetch_nft_tgs(first_slug)
+
+    create_ok = await _api_create_sticker_set(
+        token=bot.token,
+        user_id=user_id,
+        name=pack_name,
+        title=pack_title,
+        tgs_data=first_tgs_data,
+        file_id=file_ids[0] if (first_tgs_data is None and file_ids) else None,
+        filename=f"{first_slug_fn}.tgs",
+    )
+    if not create_ok:
+        # Возможно пак уже существует — продолжаем добавлять
+        logger.warning("create_sticker_pack: создание вернуло False, пробуем добавить остальное")
 
     added = 1
     await _edit_progress(progress_msg, pack_type, added, total, "➕ Добавляю стикеры…")
@@ -945,28 +935,27 @@ async def create_sticker_pack(
         if not ok or not tgs_data:
             logger.warning("Пропускаю slug %s: %s", slug, err)
             continue
-        await _add_one_sticker_to_set(
-            bot, user_id, pack_name,
-            InputSticker(
-                sticker=BufferedInputFile(tgs_data, filename=f"{slug}.tgs"),
-                emoji_list=["🎁"], format="animated",
-            )
+        ok3 = await _api_add_sticker_to_set(
+            token=bot.token, user_id=user_id, name=pack_name,
+            tgs_data=tgs_data, file_id=None, filename=f"{slug}.tgs",
         )
-        added += 1
+        if ok3:
+            added += 1
         if added % 5 == 0 or added == total:
             await _edit_progress(progress_msg, pack_type, added, total, "➕ Добавляю стикеры…")
         await asyncio.sleep(0.35)
 
     # ── Добавляем file_id-и (fallback) ───────────────────────────────────────
-    fid_list = file_ids[1:] if first_slug is None else file_ids  # первый уже добавлен
-    for fid in fid_list:
+    fid_start = 1 if (first_tgs_data is None and file_ids) else 0
+    for fid in file_ids[fid_start:]:
         if added >= 100:
             break
-        await _add_one_sticker_to_set(
-            bot, user_id, pack_name,
-            InputSticker(sticker=fid, emoji_list=["🎁"], format="animated")
+        ok4 = await _api_add_sticker_to_set(
+            token=bot.token, user_id=user_id, name=pack_name,
+            tgs_data=None, file_id=fid, filename="sticker.tgs",
         )
-        added += 1
+        if ok4:
+            added += 1
         if added % 5 == 0 or added == total:
             await _edit_progress(progress_msg, pack_type, added, total, "➕ Добавляю стикеры…")
         await asyncio.sleep(0.35)
@@ -974,26 +963,144 @@ async def create_sticker_pack(
     return pack_name
 
 
+async def _api_create_sticker_set(
+    token: str, user_id: int, name: str, title: str,
+    tgs_data: Optional[bytes], file_id: Optional[str], filename: str,
+) -> bool:
+    """
+    Прямой HTTP вызов createNewStickerSet через multipart/form-data.
+    Работает на любой версии aiogram.
+    """
+    url = f"https://api.telegram.org/bot{token}/createNewStickerSet"
+
+    stickers_json = json.dumps([{
+        "emoji_list": ["🎁"],
+        "format": "animated",
+        "sticker": file_id if file_id else "attach://sticker0",
+    }])
+
+    try:
+        if tgs_data and not file_id:
+            data = aiohttp.FormData()
+            data.add_field("user_id", str(user_id))
+            data.add_field("name", name)
+            data.add_field("title", title)
+            data.add_field("stickers", stickers_json)
+            data.add_field("sticker0", tgs_data,
+                           filename=filename, content_type="application/octet-stream")
+        else:
+            data = aiohttp.FormData()
+            data.add_field("user_id", str(user_id))
+            data.add_field("name", name)
+            data.add_field("title", title)
+            data.add_field("stickers", json.dumps([{
+                "emoji_list": ["🎁"],
+                "format": "animated",
+                "sticker": file_id or "",
+            }]))
+
+        async with get_session().post(url, data=data) as resp:
+            raw = await resp.json()
+
+        if raw.get("ok"):
+            logger.info("createNewStickerSet OK: %s", name)
+            return True
+
+        err = raw.get("description", "")
+        if any(x in err.lower() for x in ["already occupied", "name is occupied",
+                                           "invalid", "sticker_set"]):
+            logger.warning("createNewStickerSet: пак уже существует (%s)", err)
+            return True  # пак есть — продолжаем
+
+        logger.error("createNewStickerSet failed: %s", raw)
+        return False
+
+    except Exception as e:
+        logger.error("_api_create_sticker_set error: %s", e)
+        return False
+
+
+async def _api_add_sticker_to_set(
+    token: str, user_id: int, name: str,
+    tgs_data: Optional[bytes], file_id: Optional[str], filename: str,
+) -> bool:
+    """
+    Прямой HTTP вызов addStickerToSet через multipart/form-data.
+    Работает на любой версии aiogram. Обрабатывает FloodWait.
+    """
+    url = f"https://api.telegram.org/bot{token}/addStickerToSet"
+
+    for attempt in range(3):
+        try:
+            if tgs_data and not file_id:
+                sticker_json = json.dumps({
+                    "emoji_list": ["🎁"],
+                    "format": "animated",
+                    "sticker": "attach://sticker",
+                })
+                data = aiohttp.FormData()
+                data.add_field("user_id", str(user_id))
+                data.add_field("name", name)
+                data.add_field("sticker", sticker_json)
+                data.add_field("sticker", tgs_data,
+                               filename=filename, content_type="application/octet-stream")
+            else:
+                sticker_json = json.dumps({
+                    "emoji_list": ["🎁"],
+                    "format": "animated",
+                    "sticker": file_id or "",
+                })
+                data = aiohttp.FormData()
+                data.add_field("user_id", str(user_id))
+                data.add_field("name", name)
+                data.add_field("sticker", sticker_json)
+
+            async with get_session().post(url, data=data) as resp:
+                raw = await resp.json()
+
+            if raw.get("ok"):
+                return True
+
+            err = raw.get("description", "")
+            err_code = raw.get("error_code", 0)
+
+            # FloodWait
+            if err_code == 429:
+                retry_after = raw.get("parameters", {}).get("retry_after", 5)
+                logger.warning("addStickerToSet FloodWait %s сек", retry_after)
+                await asyncio.sleep(retry_after + 1)
+                continue
+
+            # Уже есть
+            if any(x in err.lower() for x in ["not_modified", "already", "duplicate"]):
+                return True
+
+            logger.warning("addStickerToSet failed: %s", raw)
+            return False
+
+        except Exception as e:
+            logger.warning("_api_add_sticker_to_set attempt %d error: %s", attempt, e)
+            await asyncio.sleep(1)
+
+    return False
+
+
 async def _add_one_sticker_to_set(
     bot: Bot, user_id: int, pack_name: str, sticker_obj: InputSticker
 ) -> bool:
-    """Добавляет один стикер в сет. Обрабатывает FloodWait и ошибки. Возвращает успех."""
-    for attempt in range(2):
-        try:
-            await bot.add_sticker_to_set(user_id=user_id, name=pack_name, sticker=sticker_obj)
-            return True
-        except TelegramRetryAfter as e:
-            logger.warning("FloodWait %s сек при добавлении стикера", e.retry_after)
-            await asyncio.sleep(e.retry_after + 1)
-        except TelegramBadRequest as e:
-            e_str = str(e).lower()
-            if "not_modified" in e_str or "already" in e_str:
-                return True  # уже есть — окей
-            logger.warning("add_sticker_to_set bad request: %s", e)
-            return False
-        except Exception as e:
-            logger.warning("add_sticker_to_set error: %s", e)
-            return False
+    """Обёртка для совместимости — теперь используем прямые HTTP вызовы."""
+    # Достаём данные из InputSticker
+    sticker = sticker_obj.sticker
+    if isinstance(sticker, BufferedInputFile):
+        return await _api_add_sticker_to_set(
+            token=bot.token, user_id=user_id, name=pack_name,
+            tgs_data=sticker.data, file_id=None, filename=sticker.filename or "sticker.tgs",
+        )
+    elif isinstance(sticker, str):
+        return await _api_add_sticker_to_set(
+            token=bot.token, user_id=user_id, name=pack_name,
+            tgs_data=None, file_id=sticker, filename="sticker.tgs",
+        )
     return False
 
 
@@ -1059,12 +1166,18 @@ async def add_single_sticker_to_pack(
         if pack is None:
             # Создаём новый личный стикерпак
             pack_title = make_pack_title(username, "personal", BOT_USERNAME)
-            await bot.create_new_sticker_set(
+            create_ok = await _api_create_sticker_set(
+                token=bot.token,
                 user_id=user_id,
                 name=pack_name,
                 title=pack_title,
-                stickers=[sticker_obj],
+                tgs_data=tgs_data,
+                file_id=None,
+                filename=f"{slug}.tgs",
             )
+            if not create_ok:
+                # Возможно пак уже есть (бот перезапускался)
+                logger.warning("create personal pack returned False — пробуем добавить")
             set_user_pack(user_id, "personal", {
                 "name": pack_name,
                 "title": pack_title,
@@ -1075,8 +1188,10 @@ async def add_single_sticker_to_pack(
                 "count": 1,
             })
         else:
-            # Добавляем в существующий
-            success = await _add_one_sticker_to_set(bot, user_id, pack_name, sticker_obj)
+            success = await _api_add_sticker_to_set(
+                token=bot.token, user_id=user_id, name=pack_name,
+                tgs_data=tgs_data, file_id=None, filename=f"{slug}.tgs",
+            )
             if not success:
                 return False, "add_failed"
             add_slug_to_personal(user_id, slug)
@@ -1084,36 +1199,6 @@ async def add_single_sticker_to_pack(
         logger.info("Добавлен стикер %s в личный пак user_id=%s", slug, user_id)
         return True, pack_name
 
-    except TelegramBadRequest as e:
-        e_str = str(e).lower()
-        if "not_modified" in e_str or "already" in e_str:
-            add_slug_to_personal(user_id, slug)
-            return True, pack_name
-        # Если пак уже существует (бот перезапускался и потерял данные в памяти)
-        if "occupied" in e_str or "invalid" in e_str:
-            # Пак уже есть — сохраняем в память и добавляем стикер
-            pack_title = make_pack_title(username, "personal", BOT_USERNAME)
-            set_user_pack(user_id, "personal", {
-                "name": pack_name,
-                "title": pack_title,
-                "slugs": [],
-                "slugs_set": set(),
-                "created_at": time.time(),
-                "updated_at": time.time(),
-                "count": 0,
-            })
-            # Пробуем добавить
-            sticker_obj2 = InputSticker(
-                sticker=BufferedInputFile(tgs_data, filename=f"{slug}.tgs"),
-                emoji_list=["🎁"],
-                format="animated",
-            )
-            success = await _add_one_sticker_to_set(bot, user_id, pack_name, sticker_obj2)
-            if success:
-                add_slug_to_personal(user_id, slug)
-                return True, pack_name
-        logger.error("add_single_sticker_to_pack error: %s", e)
-        return False, str(e)
     except Exception as e:
         logger.error("add_single_sticker_to_pack unexpected: %s", e)
         return False, str(e)
