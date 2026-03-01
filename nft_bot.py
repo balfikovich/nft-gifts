@@ -107,7 +107,7 @@ CB_SEND_GIF          = "gif:"  # gif:slug → GIF анимация
 CB_DONATE            = "donate"
 
 ANTISPAM_SECONDS  = 1.5
-ANTISPAM_SLUG_SEC = 300   # 5 мин — повтор одного подарка в группе
+ANTISPAM_SLUG_SEC = 120   # 2 мин — повтор одного подарка в группе
 
 # Custom Emoji IDs
 E_GIFT   = "5408829285685291820"
@@ -186,8 +186,9 @@ def check_antispam(user_id: int) -> float:
     return 0.0
 
 
-def check_slug_antispam(user_id: int, slug: str) -> float:
-    key  = f"{user_id}:{slug.lower()}"
+def check_slug_antispam(chat_id: int, slug: str) -> float:
+    """Антиспам по slug привязан к чату — в разных чатах независимо."""
+    key  = f"{chat_id}:{slug.lower()}"
     now  = time.monotonic()
     last = _last_slug.get(key, 0.0)
     diff = now - last
@@ -984,6 +985,7 @@ async def payment_handler(message: Message) -> None:
         f'<tg-emoji emoji-id="{E_DONATE}">⭐</tg-emoji> <b>Огромное спасибо!</b>\n'
         "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
         f"Ты отправил <b>{stars} ⭐</b> — это очень приятно! 🚀\n\n"
+        "Я обязательно напишу тебе лично, чтобы поблагодарить! 🙏\n\n"
         f"<i>С уважением, <a href='https://t.me/balfikovich'>@balfikovich</a></i>",
         parse_mode=ParseMode.HTML,
     )
@@ -1092,7 +1094,7 @@ async def callback_send_gif(callback: CallbackQuery) -> None:
         return
 
     _cb_lock[uid] = True
-    await callback.answer("⏳ Конвертирую в GIF…")
+    await callback.answer("⏳ Загружаю…")
 
     try:
         found, tgs_data, err = await fetch_nft_tgs(slug)
@@ -1102,31 +1104,31 @@ async def callback_send_gif(callback: CallbackQuery) -> None:
             )
             return
 
-        wm = await callback.message.answer("⚙️ Создаю GIF…")
+        wm = await callback.message.answer("⚙️ Конвертирую…")
         try:
-            gif_data = await asyncio.wait_for(
-                asyncio.to_thread(tgs_to_gif, tgs_data),
+            mp4_data = await asyncio.wait_for(
+                asyncio.to_thread(tgs_to_mp4, tgs_data),
                 timeout=120.0,
             )
         except asyncio.TimeoutError:
-            gif_data = None
+            mp4_data = None
         await safe_delete(wm)
 
-        if not gif_data:
-            await callback.message.answer("❌ Не удалось создать GIF.")
+        if not mp4_data:
+            await callback.message.answer("❌ Не удалось конвертировать.")
             return
 
         _used_gif.add(key)
         await remove_keyboard_button(callback.message, CB_SEND_GIF)
 
-        # Отправляем GIF как документ (с расширением .gif — Telegram покажет как анимацию)
-        file = BufferedInputFile(gif_data, filename=f"{slug}.gif")
+        # Шлём MP4 через answer_animation — Telegram сам конвертирует в GIF
+        # на своей стороне с максимальным качеством
+        file = BufferedInputFile(mp4_data, filename=f"{slug}.mp4")
         await callback.message.answer_animation(animation=file)
 
-        user_log.info("🎞 GIF | slug=%s | %s", slug, _u(callback.from_user))
+        user_log.info("🎞 GIF (MP4→Telegram) | slug=%s | %s", slug, _u(callback.from_user))
     finally:
         _cb_lock[uid] = False
-
 
 # ── «Без сжатия» под статичной фоткой (группа) — шлёт PNG документом ─────────
 @dp.callback_query(F.data.startswith(CB_NO_COMPRESS))
@@ -1408,8 +1410,8 @@ async def _handle_group_static(message: Message, raw: str) -> None:
     user_log.info("🖼 ЗАПРОС (группа) | slug=%s | %s | %s",
                   slug, _u(message.from_user), _chat(message.chat))
 
-    # Антиспам по slug для группы
-    wait = check_slug_antispam(uid, slug)
+    # Антиспам по slug привязан к чату (не к пользователю)
+    wait = check_slug_antispam(message.chat.id, slug)
     if wait > 0:
         mins, secs = wait // 60, wait % 60
         ts = f"{mins} мин {secs} сек" if mins else f"{secs} сек"
@@ -1485,8 +1487,8 @@ async def _handle_group_video(message: Message, raw: str) -> None:
     user_log.info("🎬 ЗАПРОС (группа аним) | slug=%s | %s | %s",
                   slug, _u(message.from_user), _chat(message.chat))
 
-    # Антиспам по slug для группы
-    wait = check_slug_antispam(uid, slug)
+    # Антиспам по slug привязан к чату (не к пользователю)
+    wait = check_slug_antispam(message.chat.id, slug)
     if wait > 0:
         mins, secs = wait // 60, wait % 60
         ts = f"{mins} мин {secs} сек" if mins else f"{secs} сек"
