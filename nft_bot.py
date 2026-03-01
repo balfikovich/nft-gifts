@@ -984,6 +984,7 @@ async def payment_handler(message: Message) -> None:
         f'<tg-emoji emoji-id="{E_DONATE}">⭐</tg-emoji> <b>Огромное спасибо!</b>\n'
         "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
         f"Ты отправил <b>{stars} ⭐</b> — это очень приятно! 🚀\n\n"
+        "Я обязательно напишу тебе лично, чтобы поблагодарить! 🙏\n\n"
         f"<i>С уважением, <a href='https://t.me/balfikovich'>@balfikovich</a></i>",
         parse_mode=ParseMode.HTML,
     )
@@ -1278,10 +1279,13 @@ async def callback_send_sticker(callback: CallbackQuery) -> None:
         _used_sticker.add(key)
         await remove_keyboard_button(callback.message, CB_SEND_STICKER)
 
+        # TGS нельзя отправить через answer_sticker с BufferedInputFile —
+        # Telegram принимает только file_id или URL для стикеров.
+        # Отправляем как документ с расширением .tgs — Telegram сам откроет его как анимированный стикер.
         file = BufferedInputFile(tgs_data, filename=f"{slug}.tgs")
-        await callback.message.answer_sticker(sticker=file)
+        await callback.message.answer_document(document=file)
 
-        user_log.info("🎭 СТИКЕР | slug=%s | %s", slug, _u(callback.from_user))
+        user_log.info("🎭 СТИКЕР (документ) | slug=%s | %s", slug, _u(callback.from_user))
     finally:
         _cb_lock[uid] = False
 
