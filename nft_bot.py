@@ -99,10 +99,11 @@ FRAGMENT_TGS_URL   = "https://nft.fragment.com/gift/{slug}.tgs"
 REQUEST_TIMEOUT    = aiohttp.ClientTimeout(total=30)
 
 # callback_data префиксы — важно: не должны быть префиксом друг друга
-CB_NO_COMPRESS  = "nc:"     # nc:slug   → PNG документ (без сжатия) под статичной фоткой
-CB_NO_ANIM      = "na:"     # na:slug   → PNG документ под MP4
-CB_SEND_STICKER = "sk:"     # sk:slug   → TGS стикер
-CB_DONATE       = "donate"
+CB_NO_COMPRESS       = "nc:"   # nc:slug  → PNG документ (без сжатия) под статичной фоткой
+CB_NO_ANIM           = "na:"   # na:slug  → PNG документ под MP4
+CB_SEND_STICKER      = "sk:"   # sk:slug  → TGS стикер
+CB_NO_COMPRESS_VIDEO = "ncv:"  # ncv:slug → MP4 документом (без сжатия Telegram)
+CB_DONATE            = "donate"
 
 ANTISPAM_SECONDS  = 1.5
 ANTISPAM_SLUG_SEC = 300   # 5 мин — повтор одного подарка в группе
