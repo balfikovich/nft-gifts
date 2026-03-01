@@ -984,7 +984,6 @@ async def payment_handler(message: Message) -> None:
         f'<tg-emoji emoji-id="{E_DONATE}">⭐</tg-emoji> <b>Огромное спасибо!</b>\n'
         "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
         f"Ты отправил <b>{stars} ⭐</b> — это очень приятно! 🚀\n\n"
-        "Я обязательно напишу тебе лично, чтобы поблагодарить! 🙏\n\n"
         f"<i>С уважением, <a href='https://t.me/balfikovich'>@balfikovich</a></i>",
         parse_mode=ParseMode.HTML,
     )
