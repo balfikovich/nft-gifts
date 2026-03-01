@@ -171,7 +171,7 @@ _awaiting_donate:  set[int]         = set()
 _last_instr:       dict[int, float] = {}   # chat_id → timestamp
 _last_button:      dict[str, float]  = {}   # "user_id:cb_prefix" → timestamp
 ANTISPAM_INSTR_SEC  = 300  # 5 мин
-ANTISPAM_BUTTON_SEC = 1.5  # 1.5 сек между нажатиями одной кнопки
+ANTISPAM_BUTTON_SEC = 90.0  # 90 сек между нажатиями одной кнопки
 
 BOT_USERNAME: str = ""
 
@@ -656,10 +656,8 @@ def make_keyboard_static(slug: str) -> InlineKeyboardMarkup:
 
 
 def make_keyboard_video(slug: str) -> InlineKeyboardMarkup:
-    """Под MP4 видео — 4 кнопки."""
+    """Под MP4 видео — 3 кнопки."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📁 Видео файлом (без сжатия)",
-                              callback_data=f"{CB_NO_COMPRESS_VIDEO}{slug}")],
         [InlineKeyboardButton(text="🎞 Отправить как GIF",
                               callback_data=f"{CB_SEND_GIF}{slug}")],
         [InlineKeyboardButton(text="🖼 Без анимации (PNG)",
@@ -1023,7 +1021,10 @@ async def callback_no_compress_video(callback: CallbackQuery) -> None:
 
     wait = check_button_antispam(uid, CB_NO_COMPRESS_VIDEO)
     if wait > 0:
-        await callback.answer(f"⏳ Подожди ещё {wait} сек.", show_alert=False)
+        mins = int(wait) // 60
+        secs = int(wait) % 60
+        ts = f"{mins} мин {secs} сек" if mins else f"{secs} сек"
+        await callback.answer(f"⏳ Подожди ещё {ts}", show_alert=False)
         return
 
     if _cb_lock.get(uid):
@@ -1081,7 +1082,10 @@ async def callback_send_gif(callback: CallbackQuery) -> None:
 
     wait = check_button_antispam(uid, CB_SEND_GIF)
     if wait > 0:
-        await callback.answer(f"⏳ Подожди ещё {wait} сек.", show_alert=False)
+        mins = int(wait) // 60
+        secs = int(wait) % 60
+        ts = f"{mins} мин {secs} сек" if mins else f"{secs} сек"
+        await callback.answer(f"⏳ Подожди ещё {ts}", show_alert=False)
         return
 
     if _cb_lock.get(uid):
@@ -1139,7 +1143,10 @@ async def callback_no_compress(callback: CallbackQuery) -> None:
 
     wait = check_button_antispam(uid, CB_NO_COMPRESS)
     if wait > 0:
-        await callback.answer(f"⏳ Подожди ещё {wait} сек.", show_alert=False)
+        mins = int(wait) // 60
+        secs = int(wait) % 60
+        ts = f"{mins} мин {secs} сек" if mins else f"{secs} сек"
+        await callback.answer(f"⏳ Подожди ещё {ts}", show_alert=False)
         return
 
     if key in _used_no_compress:
@@ -1192,7 +1199,10 @@ async def callback_no_anim(callback: CallbackQuery) -> None:
 
     wait = check_button_antispam(uid, CB_NO_ANIM)
     if wait > 0:
-        await callback.answer(f"⏳ Подожди ещё {wait} сек.", show_alert=False)
+        mins = int(wait) // 60
+        secs = int(wait) % 60
+        ts = f"{mins} мин {secs} сек" if mins else f"{secs} сек"
+        await callback.answer(f"⏳ Подожди ещё {ts}", show_alert=False)
         return
 
     if _cb_lock.get(uid):
@@ -1245,7 +1255,10 @@ async def callback_send_sticker(callback: CallbackQuery) -> None:
 
     wait = check_button_antispam(uid, CB_SEND_STICKER)
     if wait > 0:
-        await callback.answer(f"⏳ Подожди ещё {wait} сек.", show_alert=False)
+        mins = int(wait) // 60
+        secs = int(wait) % 60
+        ts = f"{mins} мин {secs} сек" if mins else f"{secs} сек"
+        await callback.answer(f"⏳ Подожди ещё {ts}", show_alert=False)
         return
 
     if _cb_lock.get(uid):
