@@ -432,9 +432,12 @@ def _check_ffmpeg() -> bool:
 
 def tgs_to_mp4(tgs_bytes: bytes, size: int = 512) -> Optional[bytes]:
     """
-    TGS → MP4 (H.264, без звука).
+    TGS → MP4 максимальное качество:
+    - Рендер кадров в 1024×1024 (апскейл через rlottie)
+    - Белый фон вместо чёрного (нативный для подарков)
+    - libx264 с CRF=0 (lossless), preset=veryslow
+    - yuv420p для совместимости с Telegram
     Требует: rlottie-python + ffmpeg в PATH.
-    Возвращает bytes MP4 или None при ошибке.
     """
     try:
         from rlottie_python import LottieAnimation
@@ -443,12 +446,14 @@ def tgs_to_mp4(tgs_bytes: bytes, size: int = 512) -> Optional[bytes]:
         logger.error("tgs_to_mp4: не хватает библиотеки: %s", e)
         return None
 
+    # Рендерим в двойном разрешении для максимальной чёткости
+    render_size = size * 2  # 1024×1024
+
     tmp_dir = tempfile.mkdtemp(prefix="nft_mp4_")
     tgs_path = os.path.join(tmp_dir, "anim.tgs")
     mp4_path = os.path.join(tmp_dir, "out.mp4")
 
     try:
-        # Записываем TGS во временный файл
         with open(tgs_path, "wb") as f:
             f.write(tgs_bytes)
 
@@ -462,7 +467,6 @@ def tgs_to_mp4(tgs_bytes: bytes, size: int = 512) -> Optional[bytes]:
 
         fps = max(fps, 1)
 
-        # Рендерим кадры в PNG файлы
         frames_dir = os.path.join(tmp_dir, "frames")
         os.makedirs(frames_dir, exist_ok=True)
 
@@ -470,23 +474,33 @@ def tgs_to_mp4(tgs_bytes: bytes, size: int = 512) -> Optional[bytes]:
             frame_img = anim.render_pillow_frame(frame_num=i)
             if frame_img is None:
                 continue
-            if frame_img.size != (size, size):
-                frame_img = frame_img.resize((size, size), Image.LANCZOS)
-            # Конвертируем RGBA → RGB с чёрным фоном (MP4/H.264 не поддерживает прозрачность)
-            bg = Image.new("RGB", (size, size), (0, 0, 0))
-            bg.paste(frame_img, mask=frame_img.split()[3] if frame_img.mode == "RGBA" else None)
-            bg.save(os.path.join(frames_dir, f"frame_{i:05d}.png"), format="PNG")
 
-        # ffmpeg: PNG-кадры → MP4
+            # Апскейл до 1024×1024 с LANCZOS
+            if frame_img.size != (render_size, render_size):
+                frame_img = frame_img.resize((render_size, render_size), Image.LANCZOS)
+
+            # Белый фон — нативный для Telegram NFT подарков
+            bg = Image.new("RGB", (render_size, render_size), (255, 255, 255))
+            if frame_img.mode == "RGBA":
+                bg.paste(frame_img, mask=frame_img.split()[3])
+            else:
+                bg.paste(frame_img)
+
+            # Сохраняем PNG без сжатия для максимального качества передачи в ffmpeg
+            bg.save(os.path.join(frames_dir, f"frame_{i:05d}.png"),
+                    format="PNG", compress_level=0)
+
+        # ffmpeg: PNG 1024×1024 → MP4 максимального качества
         cmd = [
             "ffmpeg", "-y",
             "-framerate", str(fps),
             "-i", os.path.join(frames_dir, "frame_%05d.png"),
             "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",   # совместимость с Telegram и всеми плеерами
-            "-crf", "18",            # качество (0=лучшее, 51=худшее, 18=почти без потерь)
-            "-preset", "fast",
-            "-movflags", "+faststart",
+            "-pix_fmt", "yuv420p",     # совместимость с Telegram
+            "-crf", "0",               # lossless — максимальное качество
+            "-preset", "veryslow",     # максимальное сжатие при lossless
+            "-tune", "animation",      # оптимизация под анимацию
+            "-movflags", "+faststart", # быстрый старт воспроизведения
             mp4_path,
         ]
         result = subprocess.run(cmd, capture_output=True, timeout=120)
