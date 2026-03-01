@@ -432,10 +432,10 @@ def _check_ffmpeg() -> bool:
 
 def tgs_to_mp4(tgs_bytes: bytes, size: int = 512) -> Optional[bytes]:
     """
-    TGS → MP4 максимальное качество:
-    - Рендер кадров в 1024×1024 (апскейл через rlottie)
-    - Белый фон вместо чёрного (нативный для подарков)
-    - libx264 с CRF=0 (lossless), preset=veryslow
+    TGS → MP4 максимальное качество + максимальная скорость:
+    - Рендер 512×512 (нативный размер TGS, апскейл не даёт реального качества)
+    - Белый фон (нативный для Telegram NFT подарков)
+    - libx264 CRF=0 (lossless), preset=fast, threads=0 (все ядра)
     - yuv420p для совместимости с Telegram
     Требует: rlottie-python + ffmpeg в PATH.
     """
@@ -446,8 +446,7 @@ def tgs_to_mp4(tgs_bytes: bytes, size: int = 512) -> Optional[bytes]:
         logger.error("tgs_to_mp4: не хватает библиотеки: %s", e)
         return None
 
-    # Рендерим в двойном разрешении для максимальной чёткости
-    render_size = size * 2  # 1024×1024
+    render_size = size  # 512×512 — нативный размер TGS
 
     tmp_dir = tempfile.mkdtemp(prefix="nft_mp4_")
     tgs_path = os.path.join(tmp_dir, "anim.tgs")
@@ -477,7 +476,7 @@ def tgs_to_mp4(tgs_bytes: bytes, size: int = 512) -> Optional[bytes]:
 
             # Апскейл до 1024×1024 с LANCZOS
             if frame_img.size != (render_size, render_size):
-                frame_img = frame_img.resize((render_size, render_size), Image.LANCZOS)
+                frame_img = frame_img.resize((render_size, render_size), Image.LANCZOS)  # масштаб только если нужно
 
             # Белый фон — нативный для Telegram NFT подарков
             bg = Image.new("RGB", (render_size, render_size), (255, 255, 255))
@@ -490,17 +489,22 @@ def tgs_to_mp4(tgs_bytes: bytes, size: int = 512) -> Optional[bytes]:
             bg.save(os.path.join(frames_dir, f"frame_{i:05d}.png"),
                     format="PNG", compress_level=0)
 
-        # ffmpeg: PNG 1024×1024 → MP4 максимального качества
+        # ffmpeg: PNG → MP4, максимальное качество + скорость
+        import multiprocessing
+        cpu_count = multiprocessing.cpu_count()
+
         cmd = [
             "ffmpeg", "-y",
+            "-threads", str(cpu_count),   # все ядра сервера
             "-framerate", str(fps),
             "-i", os.path.join(frames_dir, "frame_%05d.png"),
             "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",     # совместимость с Telegram
-            "-crf", "0",               # lossless — максимальное качество
-            "-preset", "veryslow",     # максимальное сжатие при lossless
-            "-tune", "animation",      # оптимизация под анимацию
-            "-movflags", "+faststart", # быстрый старт воспроизведения
+            "-pix_fmt", "yuv420p",        # совместимость с Telegram
+            "-crf", "0",                  # lossless — нулевые потери качества
+            "-preset", "fast",            # быстро + lossless = идеально
+            "-tune", "animation",         # оптимизация под анимацию
+            "-x264-params", "ref=1:me=dia:subme=1:trellis=0:weightp=0",  # ускорение энкодера
+            "-movflags", "+faststart",    # быстрый старт воспроизведения
             mp4_path,
         ]
         result = subprocess.run(cmd, capture_output=True, timeout=120)
