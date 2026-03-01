@@ -162,8 +162,11 @@ _last_slug:        dict[str, float] = {}
 _cb_lock:          dict[int, bool]  = {}
 _used_no_compress: set[str]         = set()  # "msg_id:slug" — под статичной фоткой
 _used_no_anim:     set[str]         = set()  # "msg_id:slug" — под MP4
-_used_sticker:     set[str]         = set()  # "msg_id:slug" — под MP4
+_used_sticker:           set[str]   = set()  # "msg_id:slug" — под MP4
+_used_no_compress_video:  set[str]   = set()  # "msg_id:slug" — под MP4
 _awaiting_donate:  set[int]         = set()
+_last_instr:       dict[int, float] = {}   # chat_id → timestamp
+ANTISPAM_INSTR_SEC = 300  # 5 мин
 
 BOT_USERNAME: str = ""
 
@@ -186,6 +189,17 @@ def check_slug_antispam(user_id: int, slug: str) -> float:
     if diff < ANTISPAM_SLUG_SEC:
         return int(ANTISPAM_SLUG_SEC - diff)
     _last_slug[key] = now
+    return 0.0
+
+
+def check_instr_antispam(chat_id: int) -> float:
+    """Антиспам для «превью инструкция». 0 = можно."""
+    now  = time.monotonic()
+    last = _last_instr.get(chat_id, 0.0)
+    diff = now - last
+    if diff < ANTISPAM_INSTR_SEC:
+        return int(ANTISPAM_INSTR_SEC - diff)
+    _last_instr[chat_id] = now
     return 0.0
 
 
@@ -452,7 +466,7 @@ def tgs_to_mp4(tgs_bytes: bytes, size: int = 512) -> Optional[bytes]:
             "-i", os.path.join(frames_dir, "frame_%05d.png"),
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",   # совместимость с Telegram и всеми плеерами
-            "-crf", "23",            # качество (0=лучшее, 51=худшее)
+            "-crf", "18",            # качество (0=лучшее, 51=худшее, 18=почти без потерь)
             "-preset", "fast",
             "-movflags", "+faststart",
             mp4_path,
@@ -554,8 +568,10 @@ def make_keyboard_static(slug: str) -> InlineKeyboardMarkup:
 
 
 def make_keyboard_video(slug: str) -> InlineKeyboardMarkup:
-    """Под MP4 видео — кнопки «Без анимации» и «Стикер»."""
+    """Под MP4 видео — кнопки «Без сжатия», «Без анимации» и «Стикер»."""
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 Без сжатия (видео MP4)",
+                              callback_data=f"{CB_NO_COMPRESS_VIDEO}{slug}")],
         [InlineKeyboardButton(text="🖼 Без анимации (PNG)",
                               callback_data=f"{CB_NO_ANIM}{slug}")],
         [InlineKeyboardButton(text="🎭 Отправить стикер (TGS)",
@@ -566,6 +582,27 @@ def make_keyboard_video(slug: str) -> InlineKeyboardMarkup:
 # ══════════════════════════════════════════════════════════════════════════════
 #  ТЕКСТЫ
 # ══════════════════════════════════════════════════════════════════════════════
+
+def get_group_instruction() -> str:
+    return (
+        "📖 <b>Инструкция NFT Gift Viewer</b>\n"
+        "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
+        "<b>Форматы запросов:</b>\n\n"
+        "🖼 <b>Статичная картинка:</b>\n"
+        "<code>превью PlushPepe 22</code>\n"
+        "<code>превью t.me/nft/PlushPepe-22</code>\n\n"
+        "🎬 <b>Анимированная (MP4):</b>\n"
+        "<code>+а превью PlushPepe 22</code>\n"
+        "<code>+а превью t.me/nft/PlushPepe-22</code>\n\n"
+        "<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
+        "<b>📋 Правила:</b>\n"
+        "• Один подарок — не чаще <b>1 раза в 5 минут</b>\n"
+        "• Кнопки под превью — только 1 раз каждая\n"
+        "• <code>превью инструкция</code> — не чаще 1 раза в 5 минут\n\n"
+        "<b>❓ Нужна помощь?</b>\n"
+        "Пиши автору: <a href='https://t.me/balfikovich'>@balfikovich</a>"
+    )
+
 
 def get_group_welcome(chat_title: str) -> str:
     return (
@@ -882,6 +919,59 @@ async def payment_handler(message: Message) -> None:
 #  CALLBACKS
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ── «Без сжатия (видео)» под MP4 — шлёт MP4 документом ──────────────────────
+@dp.callback_query(F.data.startswith(CB_NO_COMPRESS_VIDEO))
+async def callback_no_compress_video(callback: CallbackQuery) -> None:
+    uid  = callback.from_user.id
+    slug = callback.data[len(CB_NO_COMPRESS_VIDEO):]
+    mid  = callback.message.message_id
+    key  = f"{mid}:{slug.lower()}"
+
+    if key in _used_no_compress_video:
+        await callback.answer("❌ Видео без сжатия уже было отправлено!", show_alert=True)
+        return
+
+    if _cb_lock.get(uid):
+        await callback.answer("⏳ Идёт загрузка…", show_alert=False)
+        return
+
+    _cb_lock[uid] = True
+    await callback.answer("⏳ Загружаю оригинал…")
+
+    try:
+        found, tgs_data, err = await fetch_nft_tgs(slug)
+        if err or not found:
+            await callback.message.answer(
+                f"❌ Не удалось загрузить: {err or 'файл не найден'}"
+            )
+            return
+
+        # Конвертируем TGS → MP4 с максимальным качеством (CRF=18)
+        wm = await callback.message.answer("⚙️ Конвертирую в видео без сжатия…")
+        try:
+            mp4_data = await asyncio.wait_for(
+                asyncio.to_thread(tgs_to_mp4, tgs_data),
+                timeout=120.0,
+            )
+        except asyncio.TimeoutError:
+            mp4_data = None
+        await safe_delete(wm)
+
+        if not mp4_data:
+            await callback.message.answer("❌ Не удалось конвертировать видео.")
+            return
+
+        _used_no_compress_video.add(key)
+        await remove_keyboard_button(callback.message, CB_NO_COMPRESS_VIDEO)
+
+        # Отправляем MP4 как документ — Telegram не будет его перекодировать
+        await send_document(callback.message.answer_document, mp4_data, f"{slug}.mp4")
+
+        user_log.info("📤 БЕЗ СЖАТИЯ ВИДЕО | slug=%s | %s", slug, _u(callback.from_user))
+    finally:
+        _cb_lock[uid] = False
+
+
 # ── «Без сжатия» под статичной фоткой (группа) — шлёт PNG документом ─────────
 @dp.callback_query(F.data.startswith(CB_NO_COMPRESS))
 async def callback_no_compress(callback: CallbackQuery) -> None:
@@ -1080,6 +1170,20 @@ async def handle_text(message: Message) -> None:
     # ── ГРУППА ────────────────────────────────────────────────────────────────
     if not is_private:
         lower = raw.lower()
+
+        # «превью инструкция» — показать инструкцию
+        if lower.strip() in ("превью инструкция", "preview инструкция",
+                             "превью instruction", "preview instruction"):
+            wait = check_instr_antispam(message.chat.id)
+            if wait > 0:
+                user_log.info("🚫 ИНСТРУКЦИЯ СПАМ | %s | %s",
+                              _u(message.from_user), _chat(message.chat))
+                await safe_delete(message)
+                return
+            user_log.info("📖 ИНСТРУКЦИЯ | %s | %s",
+                          _u(message.from_user), _chat(message.chat))
+            await message.answer(get_group_instruction(), parse_mode=ParseMode.HTML)
+            return
 
         # «+а превью ...» — анимированная (MP4)
         if lower.startswith("+а превью") or lower.startswith("+а preview"):
