@@ -10,8 +10,9 @@ NFT Gift Viewer Bot
     LOG_FILE=bot.log   (опционально)
 
 Логика:
-    ЛИЧКА   → TGS → MP4 видео с подписью (caption entities) + кнопки «Без анимации» / «Стикер»
-    ГРУППА  → «превью ...» → PNG фото с caption + кнопка «Без сжатия» (PNG документ)
+    ЛИЧКА        → TGS → MP4 видео с подписью (caption entities) + кнопки «Без анимации» / «Стикер»
+    ГРУППА       → «превью ...»    → PNG фото с caption + кнопка «Без сжатия» (PNG документ)
+    ГРУППА       → «+а превью ...» → MP4 видео с подписью + кнопки «Без анимации» / «Стикер»
 """
 
 import asyncio
@@ -572,15 +573,17 @@ def get_group_welcome(chat_title: str) -> str:
         "Я <b>NFT Gift Viewer</b> — показываю карточку любого Telegram NFT-подарка.\n\n"
         "<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
         "<b>📌 Как пользоваться:</b>\n\n"
-        "Напиши <b>превью</b> и ссылку или название подарка:\n\n"
+        "🖼 <b>Статичная картинка:</b>\n"
         "<code>превью PlushPepe 22</code>\n"
-        "<code>превью t.me/nft/PlushPepe-22</code>\n"
-        "<code>превью https://t.me/nft/PlushPepe-22</code>\n\n"
+        "<code>превью t.me/nft/PlushPepe-22</code>\n\n"
+        "🎬 <b>Анимированная (MP4):</b>\n"
+        "<code>+а превью PlushPepe 22</code>\n"
+        "<code>+а превью t.me/nft/PlushPepe-22</code>\n\n"
         "<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
         "<b>📋 Правила:</b>\n"
         "• Один подарок — не чаще <b>1 раза в 5 минут</b>\n"
-        "• Кнопка <b>«Без сжатия»</b> — только 1 раз на превью\n\n"
-        "⚡ Результат за ~1–2 сек\n\n"
+        "• Кнопки под превью — только 1 раз каждая\n\n"
+        "⚡ Картинка ~1–2 сек | Видео ~3–6 сек\n\n"
         "<i>Автор: <a href='https://t.me/balfikovich'>@balfikovich</a></i>"
     )
 
@@ -601,11 +604,11 @@ def get_start_text() -> str:
         "Под видео — кнопки <b>«Без анимации»</b> (PNG) и <b>«Стикер»</b> (TGS).\n\n"
         "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
         "<b>👥 В группе:</b>\n"
-        "<code>превью PlushPepe 22</code>\n"
-        "<code>превью t.me/nft/PlushPepe-22</code>\n\n"
+        "🖼 <b>Статичная:</b> <code>превью PlushPepe 22</code>\n"
+        "🎬 <b>Анимация:</b>  <code>+а превью PlushPepe 22</code>\n\n"
         "<b>📋 Правила в группе:</b>\n"
         "• Повтор одного подарка — не чаще <b>1 раза в 5 минут</b>\n"
-        "• <b>«Без сжатия»</b> — только 1 раз на превью\n\n"
+        "• Кнопки под превью — только 1 раз каждая\n\n"
         "<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
         "⚡ Видео ~3–6 сек | Картинка ~1–2 сек\n\n"
         "<i>Автор: <a href='https://t.me/balfikovich'>@balfikovich</a></i>"
@@ -1074,16 +1077,29 @@ async def handle_text(message: Message) -> None:
             )
         return
 
-    # ── ГРУППА: только «превью ...» → статичная PNG ───────────────────────────
+    # ── ГРУППА ────────────────────────────────────────────────────────────────
     if not is_private:
         lower = raw.lower()
-        if not (lower.startswith("превью") or lower.startswith("preview")):
+
+        # «+а превью ...» — анимированная (MP4)
+        if lower.startswith("+а превью") or lower.startswith("+а preview"):
+            for prefix in ("+а превью", "+а preview"):
+                if lower.startswith(prefix):
+                    raw = raw[len(prefix):].strip()
+                    break
+            await _handle_group_video(message, raw)
             return
-        for prefix in ("превью", "preview"):
-            if lower.startswith(prefix):
-                raw = raw[len(prefix):].strip()
-                break
-        await _handle_group_static(message, raw)
+
+        # «превью ...» — статичная PNG
+        if lower.startswith("превью") or lower.startswith("preview"):
+            for prefix in ("превью", "preview"):
+                if lower.startswith(prefix):
+                    raw = raw[len(prefix):].strip()
+                    break
+            await _handle_group_static(message, raw)
+            return
+
+        # Не наше сообщение — игнорируем
         return
 
     # ── ЛИЧКА: всегда MP4 видео → при ошибке откат на PNG ────────────────────
@@ -1165,6 +1181,109 @@ async def _handle_group_static(message: Message, raw: str) -> None:
             await send_document(message.answer_document, webp, f"{slug}.webp")
     else:
         await send_document(message.answer_document, webp, f"{slug}.webp")
+
+
+# ── Анимированная MP4 (группа) ───────────────────────────────────────────────
+async def _handle_group_video(message: Message, raw: str) -> None:
+    uid  = message.from_user.id
+    slug = extract_nft_slug(raw)
+
+    if not slug:
+        user_log.info("❓ НЕВЕРНЫЙ ФОРМАТ (группа аним) | %s | %s",
+                      _u(message.from_user), _chat(message.chat))
+        await message.answer(
+            f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> <b>Неверный формат.</b>\n\n'
+            "<b>Примеры:</b>\n"
+            "<code>+а превью PlushPepe 22</code>\n"
+            "<code>+а превью t.me/nft/PlushPepe-22</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    user_log.info("🎬 ЗАПРОС (группа аним) | slug=%s | %s | %s",
+                  slug, _u(message.from_user), _chat(message.chat))
+
+    # Антиспам по slug для группы
+    wait = check_slug_antispam(uid, slug)
+    if wait > 0:
+        mins, secs = wait // 60, wait % 60
+        ts = f"{mins} мин {secs} сек" if mins else f"{secs} сек"
+        await message.answer(
+            f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
+            f"<b>Этот подарок уже был показан.</b>\nПовтор через <code>{ts}</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    t0 = time.monotonic()
+    wm = await message.answer("🔍 Загружаю данные…")
+
+    (img_ok, webp, img_err), (tgs_ok, tgs_data, tgs_err), attrs = await asyncio.gather(
+        fetch_nft_image(slug),
+        fetch_nft_tgs(slug),
+        fetch_nft_attrs(slug),
+    )
+
+    if not img_ok and not tgs_ok:
+        await safe_delete(wm)
+        err = tgs_err or img_err
+        if err:
+            await message.answer(
+                f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
+                f"<b>Ошибка загрузки</b>\n<code>{slug}</code>\n<i>{err}</i>",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await message.answer(
+                f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> '
+                f"<b>Подарок не найден</b>\n\n<code>{slug}</code>\n\n"
+                "<b>Возможные причины:</b>\n"
+                "• Такого номера не существует\n"
+                "• Подарок сожжён 🔥\n"
+                "• Опечатка в названии",
+                parse_mode=ParseMode.HTML,
+            )
+        return
+
+    mp4_data: Optional[bytes] = None
+    if tgs_ok and tgs_data:
+        await safe_delete(wm)
+        wm = await message.answer("⚙️ Конвертирую в видео…")
+        try:
+            mp4_data = await asyncio.wait_for(
+                asyncio.to_thread(tgs_to_mp4, tgs_data),
+                timeout=120.0,
+            )
+        except asyncio.TimeoutError:
+            mp4_data = None
+            logger.error("tgs_to_mp4 timeout (группа) | slug=%s", slug)
+
+    await safe_delete(wm)
+    elapsed = round(time.monotonic() - t0, 2)
+
+    if mp4_data:
+        ok = await send_video(message, mp4_data, slug, attrs)
+        if ok:
+            user_log.info("✅ MP4 (группа) | slug=%s | %s | %.2fс",
+                          slug, _u(message.from_user), elapsed)
+            return
+        logger.warning("send_video упал → откат на PNG (группа) | slug=%s", slug)
+
+    # Откат на статичную PNG
+    user_log.info("🖼 ОТКАТ НА PNG (группа) | slug=%s | %s", slug, _u(message.from_user))
+    if img_ok and webp:
+        png = webp_to_png(webp)
+        if png:
+            ok = await send_static_photo(message, png, slug, attrs)
+            if ok:
+                return
+        await send_document(message.answer_document, webp, f"{slug}.webp")
+    else:
+        await message.answer(
+            f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> '
+            "Не удалось создать видео и загрузить картинку.",
+            parse_mode=ParseMode.HTML,
+        )
 
 
 # ── MP4 видео (личка) ─────────────────────────────────────────────────────────
