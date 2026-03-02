@@ -663,6 +663,74 @@ def tgs_to_gif(tgs_bytes: bytes, size: int = 512) -> Optional[bytes]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  КРАФТОВЫЕ МОДЕЛИ И РЕДКОСТИ
+# ══════════════════════════════════════════════════════════════════════════════
+
+RARITY_EMOJI_IDS: dict[str, list[str]] = {
+    "legendary": ["5273884071829739701", "5272019325878833357", "5273763473443035122"],
+    "epic":      ["5271774839160478445", "5273779343347193556"],
+    "rare":      ["5273722645483917391", "5273923675723175516"],
+    "uncommon":  ["5273971740702185834", "5273715820780882978", "5271507249813034911"],
+}
+
+_DESK_CALENDAR_CRAFTED: dict[str, str] = {
+    "day of mars": "legendary", "óðinsdagr": "legendary", "loki's day": "legendary",
+    "celestial map": "legendary", "may the fourth": "legendary",
+    "selena": "epic", "aphrodite": "epic", "ton core": "epic", "frjádagr": "epic",
+    "þórsdagr": "epic", "týsdagr": "epic", "kronos": "epic", "sol invictus": "epic",
+    "shinto shrine": "epic", "royal flush": "epic", "payday": "epic",
+    "lucky day": "epic", "mánadagr": "epic", "treasure map": "epic", "glam day": "epic",
+    "frog day": "rare", "first date": "rare", "space era": "rare", "weekly set": "rare",
+    "grimoire": "rare", "cat seasons": "rare", "artwork": "rare", "ghost party": "rare",
+    "zeus": "rare", "samhain": "rare", "outlaw": "rare", "hermes": "rare",
+    "count dracula": "rare",
+    "wedding": "uncommon", "sekhmet": "uncommon", "cyberpunk": "uncommon",
+    "anniversary": "uncommon", "crunch time": "uncommon", "mesozoic": "uncommon",
+    "orchestra": "uncommon", "daily bread": "uncommon", "helios": "uncommon",
+    "god of wine": "uncommon", "steampunk": "uncommon", "launch date": "uncommon",
+    "shuffle": "uncommon", "time spin": "uncommon", "holy month": "uncommon",
+    "anno domini": "uncommon", "new year": "uncommon", "vacation": "uncommon",
+    "shopping list": "uncommon", "april fools": "uncommon", "women's day": "uncommon",
+    "vintage": "uncommon", "yoga time": "uncommon", "toy calendar": "uncommon",
+}
+
+_JINGLE_BELLS_CRAFTED: dict[str, str] = {
+    "dragon lantern": "legendary", "maneki neko": "legendary", "hot cherry": "legendary",
+    "golden dice": "legendary",
+    "krampus": "epic", "little gifts": "epic", "cash bags": "epic", "stranding": "epic",
+    "lucky bell": "epic", "white owl": "epic", "duality": "epic", "silver maces": "epic",
+    "hedgehogs": "epic",
+    "mushrooms": "rare", "tinker bell": "rare", "black gold": "rare",
+    "jungle bloom": "rare", "circus": "rare", "dolls": "rare", "nutcracker": "rare",
+    "cash machine": "rare", "bullfinch": "rare", "love song": "rare", "grinch": "rare",
+    "royal call": "rare", "wind chimes": "rare",
+    "candy houses": "uncommon", "noble pearl": "uncommon", "ice queen": "uncommon",
+    "fabergé": "uncommon", "crystal": "uncommon", "blue sapphire": "uncommon",
+    "santa claus": "uncommon", "pharaoh": "uncommon", "sleigh bells": "uncommon",
+    "red lotus": "uncommon", "sylvan echo": "uncommon", "sarcophagus": "uncommon",
+    "peonies": "uncommon", "royal charm": "uncommon", "festive night": "uncommon",
+    "pink bow": "uncommon", "spring knell": "uncommon", "royal hour": "uncommon",
+    "festive duo": "uncommon", "cozy winter": "uncommon", "flashlights": "uncommon",
+    "purple jingle": "uncommon", "steampunk": "uncommon", "reindeer": "uncommon",
+    "orchestra": "uncommon",
+}
+
+_CRAFTED_MAP: dict[str, dict[str, str]] = {
+    "deskcalendar": _DESK_CALENDAR_CRAFTED,
+    "jinglebells":  _JINGLE_BELLS_CRAFTED,
+}
+
+
+def get_craft_rarity(collection_slug_name: str, model_name: str) -> Optional[str]:
+    """Возвращает редкость крафтовой модели или None если не крафтовая."""
+    key = collection_slug_name.lower().replace(" ", "").replace("-", "")
+    crafted = _CRAFTED_MAP.get(key)
+    if crafted is None:
+        return None
+    return crafted.get(model_name.lower().strip())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  CAPTION (MessageEntity)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -674,52 +742,78 @@ def make_caption(slug: str, attrs: NftAttrs) -> tuple[str, list[MessageEntity]]:
     name, number = split_slug(slug)
     nice = normalize_gift_name(name)
 
-    # Форматируем редкость: "1.5%" → " · 1.5%"
-    r_model = f" · {attrs.model_rarity}"    if attrs.model_rarity    else ""
-    r_back  = f" · {attrs.backdrop_rarity}" if attrs.backdrop_rarity else ""
-    r_sym   = f" · {attrs.symbol_rarity}"   if attrs.symbol_rarity   else ""
+    # Проверяем крафт
+    craft_rarity = get_craft_rarity(name, attrs.model)
+    is_crafted   = craft_rarity is not None
+
+    # Заголовок: "Jingle Bells (Crafted) #60395" или "Jingle Bells #60395"
+    title_text = f"{nice} (Crafted) #{number}" if is_crafted else f"{nice} #{number}"
 
     SEP = "━━━━━━━━━━━━━━━━━━━━"
     entities: list[MessageEntity] = []
-    t = ""
+    buf = [""]  # buf[0] — текст, используем список чтобы вложенные функции могли менять
+
+    def _len() -> int:
+        return _utf16_len(buf[0])
 
     def ce(ch: str, eid: str) -> None:
-        nonlocal t
         entities.append(MessageEntity(type="custom_emoji",
-                                      offset=_utf16_len(t),
-                                      length=_utf16_len(ch),
+                                      offset=_len(), length=_utf16_len(ch),
                                       custom_emoji_id=eid))
-        t += ch
+        buf[0] += ch
 
     def bold(s: str) -> None:
-        nonlocal t
-        entities.append(MessageEntity(type="bold", offset=_utf16_len(t), length=_utf16_len(s)))
-        t += s
+        entities.append(MessageEntity(type="bold", offset=_len(), length=_utf16_len(s)))
+        buf[0] += s
 
     def code(s: str) -> None:
-        nonlocal t
-        entities.append(MessageEntity(type="code", offset=_utf16_len(t), length=_utf16_len(s)))
-        t += s
+        entities.append(MessageEntity(type="code", offset=_len(), length=_utf16_len(s)))
+        buf[0] += s
 
     def lnk(s: str, url: str) -> None:
-        nonlocal t
-        entities.append(MessageEntity(type="text_link", offset=_utf16_len(t),
+        entities.append(MessageEntity(type="text_link", offset=_len(),
                                       length=_utf16_len(s), url=url))
-        t += s
+        buf[0] += s
 
     def p(s: str) -> None:
-        nonlocal t
-        t += s
+        buf[0] += s
 
-    ce("🎁", E_GIFT);  p(" "); bold(f"{nice} #{number}"); p("\n")
-    code(SEP);          p("\n")
-    ce("🪄", E_MODEL); p(" "); bold("Модель:");  p(f" {attrs.model}{r_model}\n")
-    ce("🎨", E_BACK);  p(" "); bold("Фон:");     p(f" {attrs.backdrop}{r_back}\n")
-    ce("✨", E_SYMBOL); p(" "); bold("Символ:");  p(f" {attrs.symbol}{r_sym}\n")
-    code(SEP);          p("\n")
-    ce("🔗", E_LINK);  p(" "); lnk("Открыть в Telegram", f"https://t.me/nft/{slug}")
+    def rarity_emojis(rarity: str) -> None:
+        """Вставляет набор премиум-эмодзи редкости слитно, без пробелов между ними."""
+        ids = RARITY_EMOJI_IDS.get(rarity.lower(), [])
+        for eid in ids:
+            ch = "⭐"  # placeholder одного UTF-16 символа
+            entities.append(MessageEntity(
+                type="custom_emoji",
+                offset=_len(),
+                length=_utf16_len(ch),
+                custom_emoji_id=eid,
+            ))
+            buf[0] += ch
 
-    return t, entities
+    # ── Заголовок ─────────────────────────────────────────────────────────────
+    ce("🎁", E_GIFT); p(" "); bold(title_text); p("\n")
+    code(SEP); p("\n")
+
+    # ── Модель: крафт → эмодзи редкости слитно, обычная → процент ────────────
+    ce("🪄", E_MODEL); p(" "); bold("Модель:"); p(f" {attrs.model}")
+    if is_crafted:
+        p(" ")
+        rarity_emojis(craft_rarity)
+    elif attrs.model_rarity:
+        p(f" · {attrs.model_rarity}")
+    p("\n")
+
+    # ── Фон и Символ — обычные проценты ──────────────────────────────────────
+    r_back = f" · {attrs.backdrop_rarity}" if attrs.backdrop_rarity else ""
+    r_sym  = f" · {attrs.symbol_rarity}"   if attrs.symbol_rarity   else ""
+    ce("🎨", E_BACK);  p(" "); bold("Фон:");    p(f" {attrs.backdrop}{r_back}\n")
+    ce("✨", E_SYMBOL); p(" "); bold("Символ:"); p(f" {attrs.symbol}{r_sym}\n")
+
+    code(SEP); p("\n")
+    ce("🔗", E_LINK); p(" "); lnk("Открыть в Telegram", f"https://t.me/nft/{slug}")
+
+    return buf[0], entities
 
 
 # ── Клавиатуры ────────────────────────────────────────────────────────────────
