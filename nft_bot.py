@@ -783,7 +783,7 @@ def get_group_instruction() -> str:
         "🎞 <b>Только GIF — без подписи и кнопок:</b>\n"
         "<code>+гиф превью Plush Pepe 22</code>\n"
         "<code>+гиф превью t.me/nft/PlushPepe-22</code>\n\n"
-        "🎭 <b>Только стикер TGS — анимированный стикер:</b>\n"
+        "🎭 <b>Скачать TGS файл (для импорта стикера):</b>\n"
         "<code>+тгс превью Plush Pepe 22</code>\n"
         "<code>+тгс превью t.me/nft/PlushPepe-22</code>\n\n"
         "<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
@@ -805,12 +805,12 @@ def get_group_welcome(chat_title: str) -> str:
         "🖼 <b>Статичная:</b> <code>превью Plush Pepe 22</code>\n"
         "🎬 <b>Анимация MP4:</b> <code>+а превью Plush Pepe 22</code>\n"
         "🎞 <b>Только GIF:</b> <code>+гиф превью Plush Pepe 22</code>\n"
-        "🎭 <b>Только стикер:</b> <code>+тгс превью Plush Pepe 22</code>\n\n"
+        "🎭 <b>TGS файл:</b> <code>+тгс превью Plush Pepe 22</code>\n\n"
         "<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
         "<b>📋 Правила:</b>\n"
         "• Один подарок — не чаще <b>1 раза в 5 минут</b>\n"
         "• Кнопки под превью — только 1 раз каждая\n\n"
-        "⚡ Картинка ~1–2 сек | Видео/GIF/стикер ~3–6 сек\n\n"
+        "⚡ Картинка ~1–2 сек | Видео/GIF ~3–6 сек\n\n"
         "<i>Автор: <a href='https://t.me/balfikovich'>@balfikovich</a></i>"
     )
 
@@ -828,13 +828,13 @@ def get_start_text() -> str:
         "<code>PlushPepe-22</code>\n"
         "<code>PlushPepe 22</code>\n"
         "<code>Plush Pepe 22</code>\n\n"
-        "Под видео — кнопки <b>«Без анимации»</b> (PNG) и <b>«Стикер»</b> (TGS).\n\n"
+        "Под видео — кнопки <b>«Без анимации»</b> (PNG) и <b>«Скачать TGS»</b>.\n\n"
         "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
         "<b>👥 В группе:</b>\n"
         "🖼 <b>Статичная:</b> <code>превью Plush Pepe 22</code>\n"
         "🎬 <b>Анимация MP4:</b> <code>+а превью Plush Pepe 22</code>\n"
         "🎞 <b>Только GIF:</b> <code>+гиф превью Plush Pepe 22</code>\n"
-        "🎭 <b>Только стикер:</b> <code>+тгс превью Plush Pepe 22</code>\n\n"
+        "🎭 <b>TGS файл:</b> <code>+тгс превью Plush Pepe 22</code>\n\n"
         "<b>📋 Правила в группе:</b>\n"
         "• Повтор одного подарка — не чаще <b>1 раза в 5 минут</b>\n"
         "• Кнопки под превью — только 1 раз каждая\n\n"
@@ -960,8 +960,8 @@ async def send_document(send_fn, data: bytes, filename: str) -> None:
 
 async def send_tgs_sticker(message: Message, tgs_data: bytes, slug: str) -> bool:
     """
-    Отправляет TGS как настоящий анимированный стикер (answer_sticker).
-    При ошибке возвращает False — вызывающий код делает фоллбэк на файл.
+    Отправляет TGS как анимированный стикер через answer_sticker.
+    Файл передаём с именем slug.tgs — Telegram определяет его как стикер по расширению.
     """
     file = BufferedInputFile(tgs_data, filename=f"{slug}.tgs")
     try:
@@ -977,10 +977,10 @@ async def send_tgs_sticker(message: Message, tgs_data: bytes, slug: str) -> bool
             logger.error("send_tgs_sticker retry: %s", ex)
             return False
     except TelegramBadRequest as e:
-        logger.error("send_tgs_sticker BadRequest: %s", e)
+        logger.error("send_tgs_sticker BadRequest: %s | slug=%s", e, slug)
         return False
     except Exception as e:
-        logger.error("send_tgs_sticker: %s", e)
+        logger.error("send_tgs_sticker error: %s | slug=%s", e, slug)
         return False
 
 
@@ -1365,14 +1365,10 @@ async def callback_send_sticker(callback: CallbackQuery) -> None:
         _used_sticker.add(key)
         await remove_keyboard_button(callback.message, CB_SEND_STICKER)
 
-        # Отправляем как настоящий анимированный стикер
         ok = await send_tgs_sticker(callback.message, tgs_data, slug)
         if not ok:
-            # Фоллбэк — файлом если sticker API не принял
-            logger.warning("callback_send_sticker: fallback to document | slug=%s", slug)
-            await send_document(callback.message.answer_document, tgs_data, f"{slug}.tgs")
-
-        user_log.info("🎭 СТИКЕР | slug=%s | %s", slug, _u(callback.from_user))
+            await callback.message.answer("❌ Не удалось отправить стикер.")
+        user_log.info("🎭 СТИКЕР | ok=%s | slug=%s | %s", ok, slug, _u(callback.from_user))
     finally:
         _cb_lock[uid] = False
 
@@ -1595,13 +1591,8 @@ async def _handle_group_tgs_only(message: Message, raw: str) -> None:
         )
         return
 
-    # Отправляем как настоящий анимированный стикер
-    ok = await send_tgs_sticker(message, tgs_data, slug)
-    if not ok:
-        # Фоллбэк — отправляем файлом если Telegram не принял как стикер
-        logger.warning("_handle_group_tgs_only: fallback to document | slug=%s", slug)
-        await send_document(message.answer_document, tgs_data, f"{slug}.tgs")
-
+    # Отправляем TGS файл с нормальным именем
+    await send_tgs_sticker(message, tgs_data, slug)
     user_log.info("✅ TGS-ONLY | slug=%s | %s", slug, _u(message.from_user))
 
 
