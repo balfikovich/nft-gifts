@@ -798,7 +798,7 @@ def make_caption(slug: str, attrs: NftAttrs) -> tuple[str, list[MessageEntity]]:
     # ── Модель: крафт → эмодзи редкости слитно, обычная → процент ────────────
     ce("🪄", E_MODEL); p(" "); bold("Модель:"); p(f" {attrs.model}")
     if is_crafted:
-        p(" ")
+        p(" · ")
         rarity_emojis(craft_rarity)
     elif attrs.model_rarity:
         p(f" · {attrs.model_rarity}")
