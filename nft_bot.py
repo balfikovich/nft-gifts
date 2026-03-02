@@ -399,13 +399,24 @@ async def fetch_nft_attrs(slug: str) -> NftAttrs:
 
         soup = BeautifulSoup(html, "lxml")
 
-        # ── Метод 1: таблица <tr><td>Label</td><td>Value</td></tr> ──────────
-        for row in soup.select("tr"):
-            cells = row.find_all("td")
-            if len(cells) < 2:
+        # ── Метод 1: таблица tgme_gift_table_wrap ────────────────────────────
+        # Структура: <tr><th>Model</th><td>Royal Charm <mark>0.2%</mark></td></tr>
+        for row in soup.select("div.tgme_gift_table_wrap tr"):
+            th = row.find("th")
+            td = row.find("td")
+            if not th or not td:
                 continue
-            label = cells[0].get_text(strip=True)
-            value, rarity = _extract_rarity(cells[1])
+            label = th.get_text(strip=True)
+
+            # Извлекаем <mark> с процентом редкости
+            mark_tag = td.find("mark")
+            rarity = mark_tag.get_text(strip=True) if mark_tag else ""
+            if mark_tag:
+                mark_tag.decompose()
+
+            value = td.get_text(separator=" ", strip=True)
+            value = re.sub(r'\s+', ' ', value).strip()
+
             _set_attr(attrs, label, value, rarity)
 
         # ── Метод 2: data-атрибуты ───────────────────────────────────────────
