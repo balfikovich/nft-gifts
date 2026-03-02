@@ -46,7 +46,7 @@ from dotenv import load_dotenv
 # ── Конфиг ───────────────────────────────────────────────────────────────────
 load_dotenv()
 
-BOT_TOKEN: str = os.environ.get("BOT_TOKEN", "8748246335:AAGgirhqiuwgnxVO8jYmdhCO7pbThTFiL0s")
+BOT_TOKEN: str = os.environ.get("BOT_TOKEN", "")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не задан! Создай .env: BOT_TOKEN=xxx")
 
