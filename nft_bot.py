@@ -358,37 +358,20 @@ def _set_attr(a: NftAttrs, label: str, value: str, rarity: str) -> None:
 def _extract_rarity(cell) -> tuple[str, str]:
     """
     Из ячейки таблицы извлекает (значение, процент_редкости).
-    Процент может быть:
-      - в теге <span class="...">1.5%</span>
-      - в теге <i>, <small>, <b>
-      - просто текстом "Royal Charm 0.2%"
+    Процент хранится в теге <mark>: <td>Prank Spider <mark>1.5%</mark></td>
     """
-    from bs4 import Tag
-
-    # Клонируем чтобы не портить оригинал
     import copy
     vc = copy.copy(cell)
 
     rarity = ""
 
-    # Ищем тег содержащий "%" — обычно это <span> с процентом
-    for tag in vc.find_all(["span", "i", "small", "b", "em"]):
-        t = tag.get_text(strip=True)
-        if re.search(r'\d+(?:\.\d+)?%', t):
-            rarity = t.strip()
-            tag.decompose()
-            break
+    # Ищем <mark> — именно там хранится процент редкости на t.me/nft/
+    mark = vc.find("mark")
+    if mark:
+        rarity = mark.get_text(strip=True)
+        mark.decompose()
 
     value = vc.get_text(separator=" ", strip=True)
-
-    # Если процент не нашли в теге — ищем в тексте
-    if not rarity:
-        pct = re.search(r'(\d+(?:\.\d+)?%)', value)
-        if pct:
-            rarity = pct.group(1)
-            value  = value.replace(rarity, "").strip()
-
-    # Чистим лишние пробелы
     value = re.sub(r'\s+', ' ', value).strip()
 
     return value, rarity
