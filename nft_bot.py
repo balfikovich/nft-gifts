@@ -143,35 +143,19 @@ _GIFT_NAMES: set[str] = {
     "UFC Strike", "Victory Medal", "Rare Bird",
 }
 
-# Ключ с пробелами: "plush pepe" → "Plush Pepe"
 _GIFT_NAME_MAP: dict[str, str] = {n.lower(): n for n in _GIFT_NAMES}
-
-# Ключ без пробелов: "plushpepe" → "Plush Pepe"  (для slug-имён)
 _GIFT_NAME_MAP_NOSPACE: dict[str, str] = {
     n.lower().replace(" ", ""): n for n in _GIFT_NAMES
 }
 
 
 def normalize_gift_name(raw_name: str) -> str:
-    """
-    Восстанавливает красивое название подарка из любого написания:
-      - "plushpepe"   → "Plush Pepe"
-      - "plush pepe"  → "Plush Pepe"
-      - "PlushPepe"   → "Plush Pepe"
-      - "jinglebells" → "Jingle Bells"
-    """
     key = raw_name.lower().strip()
-
-    # 1. Точное совпадение (с пробелами)
     if key in _GIFT_NAME_MAP:
         return _GIFT_NAME_MAP[key]
-
-    # 2. Без пробелов / дефисов (slug-стиль)
     key_nospace = re.sub(r"[\s\-_]+", "", key)
     if key_nospace in _GIFT_NAME_MAP_NOSPACE:
         return _GIFT_NAME_MAP_NOSPACE[key_nospace]
-
-    # 3. Fallback — разбиваем camelCase и капитализируем
     spaced = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", raw_name.strip())
     spaced = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", spaced)
     return " ".join(w.capitalize() for w in re.split(r"[\s_\-]+", spaced) if w)
@@ -268,69 +252,41 @@ _RE_WORDS = re.compile(
 
 
 def extract_nft_slug(raw: str) -> Optional[str]:
-    """
-    Парсит ввод пользователя и возвращает slug для API.
-    Если имя найдено в словаре — использует каноническое написание (без пробелов).
-
-    Примеры:
-      "plushpepe 22"     → "PlushPepe-22"
-      "plush pepe 22"    → "PlushPepe-22"
-      "Jingle Bells 100" → "JingleBells-100"
-      "PlushPepe-22"     → "PlushPepe-22"
-      "t.me/nft/PlushPepe-22" → "PlushPepe-22"
-    """
     text = raw.strip()
-
-    # 1. Ссылка t.me/nft/...
     m = _RE_LINK.search(text)
     if m:
         return m.group(1)
-
-    # 2. Уже готовый slug "Name-123"
     m = _RE_SLUG.match(text)
     if m:
-        name_raw = m.group(1)
-        number   = m.group(2)
-        # Попробуем найти красивое имя
+        name_raw  = m.group(1)
+        number    = m.group(2)
         canonical = _GIFT_NAME_MAP_NOSPACE.get(name_raw.lower().replace(" ", ""))
-        if canonical:
-            slug_name = canonical.replace(" ", "")
-        else:
-            slug_name = name_raw
+        slug_name = canonical.replace(" ", "") if canonical else name_raw
         return f"{slug_name}-{number}"
-
-    # 3. "Название с пробелами 123"
     m = _RE_WORDS.match(text)
     if m:
-        name_raw = m.group(1)   # например "plush pepe" или "Jingle Bells"
-        number   = m.group(2)
-
-        # Ищем каноническое имя в словаре
+        name_raw    = m.group(1)
+        number      = m.group(2)
         key_nospace = name_raw.lower().replace(" ", "")
         key_spaced  = name_raw.lower()
-
         if key_spaced in _GIFT_NAME_MAP:
             canonical = _GIFT_NAME_MAP[key_spaced]
         elif key_nospace in _GIFT_NAME_MAP_NOSPACE:
             canonical = _GIFT_NAME_MAP_NOSPACE[key_nospace]
         else:
-            # Не нашли в словаре — склеиваем как есть с капитализацией
             canonical = name_raw.title()
-
         slug_name = canonical.replace(" ", "")
         return f"{slug_name}-{number}"
-
     return None
 
 
 def split_slug(slug: str) -> tuple[str, str]:
-    """'PlushPepe-22' → ('PlushPepe', '22')"""
     parts = slug.rsplit("-", 1)
     return (parts[0], parts[1]) if len(parts) == 2 else (slug, "")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  АТРИБУТЫ NFT  (модель / фон / символ + проценты редкости)
+#  АТРИБУТЫ NFT
 # ══════════════════════════════════════════════════════════════════════════════
 
 class NftAttrs:
@@ -356,24 +312,15 @@ def _set_attr(a: NftAttrs, label: str, value: str, rarity: str) -> None:
 
 
 def _extract_rarity(cell) -> tuple[str, str]:
-    """
-    Из ячейки таблицы извлекает (значение, процент_редкости).
-    Процент хранится в теге <mark>: <td>Prank Spider <mark>1.5%</mark></td>
-    """
     import copy
     vc = copy.copy(cell)
-
     rarity = ""
-
-    # Ищем <mark> — именно там хранится процент редкости на t.me/nft/
     mark = vc.find("mark")
     if mark:
         rarity = mark.get_text(strip=True)
         mark.decompose()
-
     value = vc.get_text(separator=" ", strip=True)
     value = re.sub(r'\s+', ' ', value).strip()
-
     return value, rarity
 
 
@@ -396,30 +343,22 @@ async def fetch_nft_attrs(slug: str) -> NftAttrs:
             html = await resp.text()
 
         from bs4 import BeautifulSoup
-
         soup = BeautifulSoup(html, "lxml")
 
-        # ── Метод 1: таблица tgme_gift_table_wrap ────────────────────────────
-        # Структура: <tr><th>Model</th><td>Royal Charm <mark>0.2%</mark></td></tr>
         for row in soup.select("div.tgme_gift_table_wrap tr"):
             th = row.find("th")
             td = row.find("td")
             if not th or not td:
                 continue
             label = th.get_text(strip=True)
-
-            # Извлекаем <mark> с процентом редкости
             mark_tag = td.find("mark")
             rarity = mark_tag.get_text(strip=True) if mark_tag else ""
             if mark_tag:
                 mark_tag.decompose()
-
             value = td.get_text(separator=" ", strip=True)
             value = re.sub(r'\s+', ' ', value).strip()
-
             _set_attr(attrs, label, value, rarity)
 
-        # ── Метод 2: data-атрибуты ───────────────────────────────────────────
         if attrs.model == "—":
             for el in soup.find_all(attrs={"data-trait": True}):
                 label  = str(el.get("data-trait", ""))
@@ -427,7 +366,6 @@ async def fetch_nft_attrs(slug: str) -> NftAttrs:
                 rarity = str(el.get("data-rarity", ""))
                 _set_attr(attrs, label, value, rarity)
 
-        # ── Метод 3: <dt>/<dd> пары ──────────────────────────────────────────
         if attrs.model == "—":
             for dt in soup.find_all("dt"):
                 dd = dt.find_next_sibling("dd")
@@ -435,7 +373,6 @@ async def fetch_nft_attrs(slug: str) -> NftAttrs:
                     value, rarity = _extract_rarity(dd)
                     _set_attr(attrs, dt.get_text(strip=True), value, rarity)
 
-        # ── Метод 4: og:description мета-тег ─────────────────────────────────
         if attrs.model == "—":
             meta = soup.find("meta", attrs={"property": "og:description"})
             if meta:
@@ -451,7 +388,6 @@ async def fetch_nft_attrs(slug: str) -> NftAttrs:
                         k, _, v = part.strip().partition(":")
                         _set_attr(attrs, k.strip(), v.strip(), "")
 
-        # ── Метод 5: plain text парсинг ───────────────────────────────────────
         if attrs.model == "—":
             for line in soup.get_text(separator="\n").splitlines():
                 if ":" in line:
@@ -509,7 +445,7 @@ def webp_to_png(webp_bytes: bytes) -> Optional[bytes]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  TGS → MP4
+#  TGS → MP4 / GIF
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _check_ffmpeg() -> bool:
@@ -722,7 +658,6 @@ _CRAFTED_MAP: dict[str, dict[str, str]] = {
 
 
 def get_craft_rarity(collection_slug_name: str, model_name: str) -> Optional[str]:
-    """Возвращает редкость крафтовой модели или None если не крафтовая."""
     key = collection_slug_name.lower().replace(" ", "").replace("-", "")
     crafted = _CRAFTED_MAP.get(key)
     if crafted is None:
@@ -742,16 +677,14 @@ def make_caption(slug: str, attrs: NftAttrs) -> tuple[str, list[MessageEntity]]:
     name, number = split_slug(slug)
     nice = normalize_gift_name(name)
 
-    # Проверяем крафт
     craft_rarity = get_craft_rarity(name, attrs.model)
     is_crafted   = craft_rarity is not None
 
-    # Заголовок: "Jingle Bells (Crafted) #60395" или "Jingle Bells #60395"
     title_text = f"{nice} (Crafted) #{number}" if is_crafted else f"{nice} #{number}"
 
     SEP = "━━━━━━━━━━━━━━━━━━━━"
     entities: list[MessageEntity] = []
-    buf = [""]  # buf[0] — текст, используем список чтобы вложенные функции могли менять
+    buf = [""]
 
     def _len() -> int:
         return _utf16_len(buf[0])
@@ -779,10 +712,9 @@ def make_caption(slug: str, attrs: NftAttrs) -> tuple[str, list[MessageEntity]]:
         buf[0] += s
 
     def rarity_emojis(rarity: str) -> None:
-        """Вставляет набор премиум-эмодзи редкости слитно, без пробелов между ними."""
         ids = RARITY_EMOJI_IDS.get(rarity.lower(), [])
         for eid in ids:
-            ch = "⭐"  # placeholder одного UTF-16 символа
+            ch = "⭐"
             entities.append(MessageEntity(
                 type="custom_emoji",
                 offset=_len(),
@@ -791,11 +723,9 @@ def make_caption(slug: str, attrs: NftAttrs) -> tuple[str, list[MessageEntity]]:
             ))
             buf[0] += ch
 
-    # ── Заголовок ─────────────────────────────────────────────────────────────
     ce("🎁", E_GIFT); p(" "); bold(title_text); p("\n")
     code(SEP); p("\n")
 
-    # ── Модель: крафт → эмодзи редкости слитно, обычная → процент ────────────
     ce("🪄", E_MODEL); p(" "); bold("Модель:"); p(f" {attrs.model}")
     if is_crafted:
         p(" · ")
@@ -804,7 +734,6 @@ def make_caption(slug: str, attrs: NftAttrs) -> tuple[str, list[MessageEntity]]:
         p(f" · {attrs.model_rarity}")
     p("\n")
 
-    # ── Фон и Символ — обычные проценты ──────────────────────────────────────
     r_back = f" · {attrs.backdrop_rarity}" if attrs.backdrop_rarity else ""
     r_sym  = f" · {attrs.symbol_rarity}"   if attrs.symbol_rarity   else ""
     ce("🎨", E_BACK);  p(" "); bold("Фон:");    p(f" {attrs.backdrop}{r_back}\n")
@@ -845,12 +774,18 @@ def get_group_instruction() -> str:
         "📖 <b>Инструкция NFT Gift Viewer</b>\n"
         "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
         "<b>Форматы запросов:</b>\n\n"
-        "🖼 <b>Статичная картинка:</b>\n"
+        "🖼 <b>Статичная картинка (с подписью):</b>\n"
         "<code>превью Plush Pepe 22</code>\n"
         "<code>превью t.me/nft/PlushPepe-22</code>\n\n"
-        "🎬 <b>Анимированная (MP4):</b>\n"
+        "🎬 <b>Анимация MP4 (с подписью):</b>\n"
         "<code>+а превью Plush Pepe 22</code>\n"
         "<code>+а превью t.me/nft/PlushPepe-22</code>\n\n"
+        "🎞 <b>Только GIF — без подписи и кнопок:</b>\n"
+        "<code>+гиф превью Plush Pepe 22</code>\n"
+        "<code>+гиф превью t.me/nft/PlushPepe-22</code>\n\n"
+        "🎭 <b>Только стикер TGS — анимированный стикер:</b>\n"
+        "<code>+тгс превью Plush Pepe 22</code>\n"
+        "<code>+тгс превью t.me/nft/PlushPepe-22</code>\n\n"
         "<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
         "<b>📋 Правила:</b>\n"
         "• Один подарок — не чаще <b>1 раза в 5 минут</b>\n"
@@ -867,17 +802,15 @@ def get_group_welcome(chat_title: str) -> str:
         "Я <b>NFT Gift Viewer</b> — показываю карточку любого Telegram NFT-подарка.\n\n"
         "<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
         "<b>📌 Как пользоваться:</b>\n\n"
-        "🖼 <b>Статичная картинка:</b>\n"
-        "<code>превью Plush Pepe 22</code>\n"
-        "<code>превью t.me/nft/PlushPepe-22</code>\n\n"
-        "🎬 <b>Анимированная (MP4):</b>\n"
-        "<code>+а превью Plush Pepe 22</code>\n"
-        "<code>+а превью t.me/nft/PlushPepe-22</code>\n\n"
+        "🖼 <b>Статичная:</b> <code>превью Plush Pepe 22</code>\n"
+        "🎬 <b>Анимация MP4:</b> <code>+а превью Plush Pepe 22</code>\n"
+        "🎞 <b>Только GIF:</b> <code>+гиф превью Plush Pepe 22</code>\n"
+        "🎭 <b>Только стикер:</b> <code>+тгс превью Plush Pepe 22</code>\n\n"
         "<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
         "<b>📋 Правила:</b>\n"
         "• Один подарок — не чаще <b>1 раза в 5 минут</b>\n"
         "• Кнопки под превью — только 1 раз каждая\n\n"
-        "⚡ Картинка ~1–2 сек | Видео ~3–6 сек\n\n"
+        "⚡ Картинка ~1–2 сек | Видео/GIF/стикер ~3–6 сек\n\n"
         "<i>Автор: <a href='https://t.me/balfikovich'>@balfikovich</a></i>"
     )
 
@@ -899,7 +832,9 @@ def get_start_text() -> str:
         "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
         "<b>👥 В группе:</b>\n"
         "🖼 <b>Статичная:</b> <code>превью Plush Pepe 22</code>\n"
-        "🎬 <b>Анимация:</b>  <code>+а превью Plush Pepe 22</code>\n\n"
+        "🎬 <b>Анимация MP4:</b> <code>+а превью Plush Pepe 22</code>\n"
+        "🎞 <b>Только GIF:</b> <code>+гиф превью Plush Pepe 22</code>\n"
+        "🎭 <b>Только стикер:</b> <code>+тгс превью Plush Pepe 22</code>\n\n"
         "<b>📋 Правила в группе:</b>\n"
         "• Повтор одного подарка — не чаще <b>1 раза в 5 минут</b>\n"
         "• Кнопки под превью — только 1 раз каждая\n\n"
@@ -1021,6 +956,32 @@ async def send_document(send_fn, data: bytes, filename: str) -> None:
             logger.error("send_document retry: %s", ex)
     except Exception as e:
         logger.error("send_document: %s", e)
+
+
+async def send_tgs_sticker(message: Message, tgs_data: bytes, slug: str) -> bool:
+    """
+    Отправляет TGS как настоящий анимированный стикер (answer_sticker).
+    При ошибке возвращает False — вызывающий код делает фоллбэк на файл.
+    """
+    file = BufferedInputFile(tgs_data, filename=f"{slug}.tgs")
+    try:
+        await message.answer_sticker(sticker=file)
+        return True
+    except TelegramRetryAfter as e:
+        await asyncio.sleep(e.retry_after)
+        try:
+            file = BufferedInputFile(tgs_data, filename=f"{slug}.tgs")
+            await message.answer_sticker(sticker=file)
+            return True
+        except Exception as ex:
+            logger.error("send_tgs_sticker retry: %s", ex)
+            return False
+    except TelegramBadRequest as e:
+        logger.error("send_tgs_sticker BadRequest: %s", e)
+        return False
+    except Exception as e:
+        logger.error("send_tgs_sticker: %s", e)
+        return False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1403,8 +1364,14 @@ async def callback_send_sticker(callback: CallbackQuery) -> None:
 
         _used_sticker.add(key)
         await remove_keyboard_button(callback.message, CB_SEND_STICKER)
-        file = BufferedInputFile(tgs_data, filename=f"{slug}.tgs")
-        await callback.message.answer_document(document=file)
+
+        # Отправляем как настоящий анимированный стикер
+        ok = await send_tgs_sticker(callback.message, tgs_data, slug)
+        if not ok:
+            # Фоллбэк — файлом если sticker API не принял
+            logger.warning("callback_send_sticker: fallback to document | slug=%s", slug)
+            await send_document(callback.message.answer_document, tgs_data, f"{slug}.tgs")
+
         user_log.info("🎭 СТИКЕР | slug=%s | %s", slug, _u(callback.from_user))
     finally:
         _cb_lock[uid] = False
@@ -1462,6 +1429,7 @@ async def handle_text(message: Message) -> None:
     if not is_private:
         lower = raw.lower()
 
+        # Инструкция
         if lower.strip() in ("превью инструкция", "preview инструкция",
                              "превью instruction", "preview instruction"):
             wait = check_instr_antispam(message.chat.id)
@@ -1472,6 +1440,27 @@ async def handle_text(message: Message) -> None:
             await message.answer(get_group_instruction(), parse_mode=ParseMode.HTML)
             return
 
+        # +гиф превью — только GIF без подписи
+        if (lower.startswith("+гиф превью") or lower.startswith("+гиф preview")
+                or lower.startswith("+gif превью") or lower.startswith("+gif preview")):
+            for prefix in ("+гиф превью", "+гиф preview", "+gif превью", "+gif preview"):
+                if lower.startswith(prefix):
+                    raw = raw[len(prefix):].strip()
+                    break
+            await _handle_group_gif_only(message, raw)
+            return
+
+        # +тгс превью — только TGS стикер
+        if (lower.startswith("+тгс превью") or lower.startswith("+тгс preview")
+                or lower.startswith("+tgs превью") or lower.startswith("+tgs preview")):
+            for prefix in ("+тгс превью", "+тгс preview", "+tgs превью", "+tgs preview"):
+                if lower.startswith(prefix):
+                    raw = raw[len(prefix):].strip()
+                    break
+            await _handle_group_tgs_only(message, raw)
+            return
+
+        # +а превью — анимированное MP4 с подписью
         if lower.startswith("+а превью") or lower.startswith("+а preview"):
             for prefix in ("+а превью", "+а preview"):
                 if lower.startswith(prefix):
@@ -1480,6 +1469,7 @@ async def handle_text(message: Message) -> None:
             await _handle_group_video(message, raw)
             return
 
+        # превью — статичная PNG с подписью
         if lower.startswith("превью") or lower.startswith("preview"):
             for prefix in ("превью", "preview"):
                 if lower.startswith(prefix):
@@ -1492,6 +1482,127 @@ async def handle_text(message: Message) -> None:
 
     # ── ЛИЧКА ─────────────────────────────────────────────────────────────────
     await _handle_private_video(message, raw)
+
+
+# ── Только GIF без подписи (группа) ──────────────────────────────────────────
+async def _handle_group_gif_only(message: Message, raw: str) -> None:
+    slug = extract_nft_slug(raw)
+
+    if not slug:
+        await message.answer(
+            f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> <b>Неверный формат.</b>\n\n'
+            "<b>Примеры:</b>\n"
+            "<code>+гиф превью Plush Pepe 22</code>\n"
+            "<code>+гиф превью t.me/nft/PlushPepe-22</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    user_log.info("🎞 GIF-ONLY ЗАПРОС (группа) | slug=%s | %s | %s",
+                  slug, _u(message.from_user), _chat(message.chat))
+
+    wait = check_slug_antispam(message.chat.id, slug)
+    if wait > 0:
+        mins, secs = wait // 60, wait % 60
+        ts = f"{mins} мин {secs} сек" if mins else f"{secs} сек"
+        await message.answer(
+            f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
+            f"<b>Этот подарок уже был показан.</b>\nПовтор через <code>{ts}</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    wm = await message.answer("⏳ Загружаю…")
+    found, tgs_data, err = await fetch_nft_tgs(slug)
+
+    if err or not found:
+        await safe_delete(wm)
+        await message.answer(
+            f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> '
+            f"<b>Не удалось загрузить</b>\n<code>{slug}</code>\n<i>{err or 'не найден'}</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await safe_delete(wm)
+    wm = await message.answer("⚙️ Конвертирую в GIF…")
+
+    try:
+        mp4_data = await asyncio.wait_for(
+            asyncio.to_thread(tgs_to_mp4, tgs_data), timeout=120.0)
+    except asyncio.TimeoutError:
+        mp4_data = None
+
+    await safe_delete(wm)
+
+    if not mp4_data:
+        await message.answer(
+            f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> Не удалось конвертировать.',
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Отправляем как animation (зацикленный GIF/MP4) — без подписи и кнопок
+    file = BufferedInputFile(mp4_data, filename=f"{slug}.mp4")
+    try:
+        await message.answer_animation(animation=file)
+        user_log.info("✅ GIF-ONLY | slug=%s | %s", slug, _u(message.from_user))
+    except Exception as e:
+        logger.error("_handle_group_gif_only send: %s", e)
+        await message.answer(
+            f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> Не удалось отправить GIF.',
+            parse_mode=ParseMode.HTML,
+        )
+
+
+# ── Только TGS стикер (группа) ───────────────────────────────────────────────
+async def _handle_group_tgs_only(message: Message, raw: str) -> None:
+    slug = extract_nft_slug(raw)
+
+    if not slug:
+        await message.answer(
+            f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> <b>Неверный формат.</b>\n\n'
+            "<b>Примеры:</b>\n"
+            "<code>+тгс превью Plush Pepe 22</code>\n"
+            "<code>+тгс превью t.me/nft/PlushPepe-22</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    user_log.info("🎭 TGS-ONLY ЗАПРОС (группа) | slug=%s | %s | %s",
+                  slug, _u(message.from_user), _chat(message.chat))
+
+    wait = check_slug_antispam(message.chat.id, slug)
+    if wait > 0:
+        mins, secs = wait // 60, wait % 60
+        ts = f"{mins} мин {secs} сек" if mins else f"{secs} сек"
+        await message.answer(
+            f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
+            f"<b>Этот подарок уже был показан.</b>\nПовтор через <code>{ts}</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    wm = await message.answer("⏳ Загружаю стикер…")
+    found, tgs_data, err = await fetch_nft_tgs(slug)
+    await safe_delete(wm)
+
+    if err or not found:
+        await message.answer(
+            f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> '
+            f"<b>Не удалось загрузить</b>\n<code>{slug}</code>\n<i>{err or 'не найден'}</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Отправляем как настоящий анимированный стикер
+    ok = await send_tgs_sticker(message, tgs_data, slug)
+    if not ok:
+        # Фоллбэк — отправляем файлом если Telegram не принял как стикер
+        logger.warning("_handle_group_tgs_only: fallback to document | slug=%s", slug)
+        await send_document(message.answer_document, tgs_data, f"{slug}.tgs")
+
+    user_log.info("✅ TGS-ONLY | slug=%s | %s", slug, _u(message.from_user))
 
 
 # ── Статичная PNG (группа) ────────────────────────────────────────────────────
@@ -1525,7 +1636,7 @@ async def _handle_group_static(message: Message, raw: str) -> None:
         return
 
     t0 = time.monotonic()
-    wm = await message.answer(f"🔍 Загружаю…", parse_mode=ParseMode.HTML)
+    wm = await message.answer("🔍 Загружаю…", parse_mode=ParseMode.HTML)
 
     (found, webp, err), attrs = await asyncio.gather(
         fetch_nft_image(slug),
@@ -1640,7 +1751,6 @@ async def _handle_group_video(message: Message, raw: str) -> None:
                           slug, _u(message.from_user), elapsed)
             return
 
-    # Откат на PNG
     if img_ok and webp:
         png = webp_to_png(webp)
         if png:
@@ -1732,7 +1842,6 @@ async def _handle_private_video(message: Message, raw: str) -> None:
                           slug, _u(message.from_user), elapsed)
             return
 
-    # Откат на PNG
     if img_ok and webp:
         png = webp_to_png(webp)
         if png:
