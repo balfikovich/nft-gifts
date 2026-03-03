@@ -145,19 +145,35 @@ _GIFT_NAMES: set[str] = {
     "UFC Strike", "Victory Medal", "Rare Bird",
 }
 
+def _slug_key(name: str) -> str:
+    """Ключ для сравнения slug с названием: lowercase, убираем всё кроме букв и цифр."""
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
 _GIFT_NAME_MAP: dict[str, str] = {n.lower(): n for n in _GIFT_NAMES}
 _GIFT_NAME_MAP_NOSPACE: dict[str, str] = {
     n.lower().replace(" ", ""): n for n in _GIFT_NAMES
+}
+# Ключ без ЛЮБЫХ спецсимволов (апострофы, дефисы и т.д.) — для матчинга slug
+_GIFT_NAME_MAP_SLUG: dict[str, str] = {
+    _slug_key(n): n for n in _GIFT_NAMES
 }
 
 
 def normalize_gift_name(raw_name: str) -> str:
     key = raw_name.lower().strip()
+    # 1. Точное совпадение с пробелами
     if key in _GIFT_NAME_MAP:
         return _GIFT_NAME_MAP[key]
+    # 2. Убираем пробелы/дефисы/подчёркивания
     key_nospace = re.sub(r"[\s\-_]+", "", key)
     if key_nospace in _GIFT_NAME_MAP_NOSPACE:
         return _GIFT_NAME_MAP_NOSPACE[key_nospace]
+    # 3. Slug-ключ: убираем ВСЕ спецсимволы включая апострофы (khabibspapakha → Khabib's Papakha)
+    key_slug = _slug_key(raw_name)
+    if key_slug in _GIFT_NAME_MAP_SLUG:
+        return _GIFT_NAME_MAP_SLUG[key_slug]
+    # 4. Фоллбэк: CamelCase разбивка
     spaced = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", raw_name.strip())
     spaced = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", spaced)
     return " ".join(w.capitalize() for w in re.split(r"[\s_\-]+", spaced) if w)
@@ -461,23 +477,35 @@ def _format_usd(value: float) -> str:
 async def fetch_floor_price(collection_name: str) -> tuple[Optional[float], Optional[float]]:
     """
     Возвращает (floor_price, ton_rate) для коллекции по имени.
+    Сначала точное совпадение, потом slug-сравнение (без спецсимволов).
     При любой ошибке возвращает (None, None).
     """
     ok = await _refresh_floor_data()
     if not ok:
         return None, None
+
     name_lower = collection_name.lower().strip()
+    name_slug  = _slug_key(collection_name)
+
+    best = None
     for item in _floor_data_all:
         cname = str(item.get("collection", "")).lower().strip()
         if cname == name_lower:
-            fp  = item.get("floor_price")
-            tr  = item.get("ton_rate")
-            if fp is not None and tr is not None:
-                try:
-                    return float(fp), float(tr)
-                except (ValueError, TypeError):
-                    pass
-            return None, None
+            best = item
+            break
+        if best is None and _slug_key(cname) == name_slug:
+            best = item
+
+    if best is None:
+        return None, None
+
+    fp = best.get("floor_price")
+    tr = best.get("ton_rate")
+    if fp is not None and tr is not None:
+        try:
+            return float(fp), float(tr)
+        except (ValueError, TypeError):
+            pass
     return None, None
 
 
