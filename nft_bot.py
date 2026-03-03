@@ -536,7 +536,12 @@ def _check_ffmpeg() -> bool:
         return False
 
 
-def tgs_to_mp4(tgs_bytes: bytes, size: int = 512) -> Optional[bytes]:
+def tgs_to_mp4(tgs_bytes: bytes, size: int = 1024) -> Optional[bytes]:
+    """
+    Конвертирует TGS → MP4 максимального качества.
+    Рендер в 1024px с RGBA, фон чёрный (0,0,0) для Telegram,
+    кодек H.264 High Profile, CRF 10, preset slow, tune animation.
+    """
     try:
         from rlottie_python import LottieAnimation
         from PIL import Image
@@ -544,10 +549,12 @@ def tgs_to_mp4(tgs_bytes: bytes, size: int = 512) -> Optional[bytes]:
         logger.error("tgs_to_mp4: не хватает библиотеки: %s", e)
         return None
 
-    render_size = size
-    tmp_dir  = tempfile.mkdtemp(prefix="nft_mp4_")
-    tgs_path = os.path.join(tmp_dir, "anim.tgs")
-    mp4_path = os.path.join(tmp_dir, "out.mp4")
+    import shutil, multiprocessing
+
+    tmp_dir    = tempfile.mkdtemp(prefix="nft_mp4_")
+    tgs_path   = os.path.join(tmp_dir, "anim.tgs")
+    mp4_path   = os.path.join(tmp_dir, "out.mp4")
+    frames_dir = os.path.join(tmp_dir, "frames")
 
     try:
         with open(tgs_path, "wb") as f:
@@ -562,24 +569,31 @@ def tgs_to_mp4(tgs_bytes: bytes, size: int = 512) -> Optional[bytes]:
             return None
 
         fps = max(fps, 1)
-        frames_dir = os.path.join(tmp_dir, "frames")
         os.makedirs(frames_dir, exist_ok=True)
 
         for i in range(frame_count):
             frame_img = anim.render_pillow_frame(frame_num=i)
             if frame_img is None:
                 continue
-            if frame_img.size != (render_size, render_size):
-                frame_img = frame_img.resize((render_size, render_size), Image.LANCZOS)
-            bg = Image.new("RGB", (render_size, render_size), (255, 255, 255))
-            if frame_img.mode == "RGBA":
-                bg.paste(frame_img, mask=frame_img.split()[3])
-            else:
-                bg.paste(frame_img)
-            bg.save(os.path.join(frames_dir, f"frame_{i:05d}.png"),
-                    format="PNG", compress_level=0)
 
-        import multiprocessing
+            # Масштабируем с LANCZOS если нужно
+            if frame_img.size != (size, size):
+                frame_img = frame_img.resize((size, size), Image.LANCZOS)
+
+            # Конвертируем RGBA → RGB с чёрным фоном (стандарт Telegram для анимаций)
+            if frame_img.mode == "RGBA":
+                bg = Image.new("RGB", (size, size), (0, 0, 0))
+                bg.paste(frame_img, mask=frame_img.split()[3])
+                frame_img = bg
+            elif frame_img.mode != "RGB":
+                frame_img = frame_img.convert("RGB")
+
+            # Сохраняем без сжатия для максимальной скорости чтения ffmpeg
+            frame_img.save(
+                os.path.join(frames_dir, f"frame_{i:05d}.png"),
+                format="PNG", compress_level=0
+            )
+
         cpu_count = multiprocessing.cpu_count()
 
         cmd = [
@@ -587,26 +601,29 @@ def tgs_to_mp4(tgs_bytes: bytes, size: int = 512) -> Optional[bytes]:
             "-threads", str(cpu_count),
             "-framerate", str(fps),
             "-i", os.path.join(frames_dir, "frame_%05d.png"),
+            # Видео: H.264 High Profile — максимальная совместимость + качество
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
-            "-crf", "15",
-            "-preset", "fast",
-            "-tune", "animation",
-            "-profile:v", "baseline",
-            "-level", "3.1",
+            "-crf", "10",           # 0=lossless, 10=практически без потерь
+            "-preset", "slow",      # лучшая компрессия = лучшее качество при том же размере
+            "-tune", "animation",   # оптимизация для анимации
+            "-profile:v", "high",   # High Profile — убираем ограничение baseline
+            "-level", "4.2",        # поддерживает 1080p@60fps+
+            # Sharpen filter — компенсирует размытие при масштабировании
+            "-vf", "unsharp=5:5:0.8:3:3:0.4",
             "-movflags", "+faststart",
             mp4_path,
         ]
-        result = subprocess.run(cmd, capture_output=True, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, timeout=180)
         if result.returncode != 0:
-            logger.error("ffmpeg error: %s", result.stderr.decode(errors="replace")[-500:])
+            logger.error("ffmpeg mp4 error: %s", result.stderr.decode(errors="replace")[-800:])
             return None
 
         with open(mp4_path, "rb") as f:
             mp4_data = f.read()
 
-        logger.info("tgs_to_mp4 OK: %d кадров, %.1f fps, %d байт",
-                    frame_count, fps, len(mp4_data))
+        logger.info("tgs_to_mp4 OK: %d кадров, %.1f fps, %dx%d, %d байт",
+                    frame_count, fps, size, size, len(mp4_data))
         return mp4_data
 
     except subprocess.TimeoutExpired:
@@ -616,14 +633,19 @@ def tgs_to_mp4(tgs_bytes: bytes, size: int = 512) -> Optional[bytes]:
         logger.error("tgs_to_mp4 error: %s", e, exc_info=True)
         return None
     finally:
-        import shutil
         try:
             shutil.rmtree(tmp_dir, ignore_errors=True)
         except Exception:
             pass
 
 
-def tgs_to_gif(tgs_bytes: bytes, size: int = 512) -> Optional[bytes]:
+def tgs_to_gif(tgs_bytes: bytes, size: int = 800) -> Optional[bytes]:
+    """
+    Конвертирует TGS → GIF через ffmpeg с оптимальной палитрой.
+    Pillow GIF даёт 256 цветов без дизеринга — ужасное качество.
+    ffmpeg palettegen + paletteuse с dithering даёт максимум для формата GIF.
+    Рендер: 800px RGBA → PNG-кадры → ffmpeg palettegen → paletteuse (sierra2_4a dither).
+    """
     try:
         from rlottie_python import LottieAnimation
         from PIL import Image
@@ -631,8 +653,13 @@ def tgs_to_gif(tgs_bytes: bytes, size: int = 512) -> Optional[bytes]:
         logger.error("tgs_to_gif: не хватает библиотеки: %s", e)
         return None
 
-    tmp_dir  = tempfile.mkdtemp(prefix="nft_gif_")
-    tgs_path = os.path.join(tmp_dir, "anim.tgs")
+    import shutil
+
+    tmp_dir    = tempfile.mkdtemp(prefix="nft_gif_")
+    tgs_path   = os.path.join(tmp_dir, "anim.tgs")
+    palette    = os.path.join(tmp_dir, "palette.png")
+    gif_path   = os.path.join(tmp_dir, "out.gif")
+    frames_dir = os.path.join(tmp_dir, "frames")
 
     try:
         with open(tgs_path, "wb") as f:
@@ -645,9 +672,8 @@ def tgs_to_gif(tgs_bytes: bytes, size: int = 512) -> Optional[bytes]:
         if frame_count == 0:
             return None
 
-        fps         = max(fps, 1)
-        duration_ms = max(int(1000 / fps), 20)
-        frames      = []
+        fps = max(fps, 1)
+        os.makedirs(frames_dir, exist_ok=True)
 
         for i in range(frame_count):
             frame_img = anim.render_pillow_frame(frame_num=i)
@@ -655,23 +681,56 @@ def tgs_to_gif(tgs_bytes: bytes, size: int = 512) -> Optional[bytes]:
                 continue
             if frame_img.size != (size, size):
                 frame_img = frame_img.resize((size, size), Image.LANCZOS)
-            bg = Image.new("RGB", (size, size), (0, 0, 0))
-            bg.paste(frame_img, mask=frame_img.split()[3] if frame_img.mode == "RGBA" else None)
-            frames.append(bg)
 
-        if not frames:
+            # Сохраняем RGBA — ffmpeg сам обработает прозрачность
+            frame_img.save(
+                os.path.join(frames_dir, f"frame_{i:05d}.png"),
+                format="PNG", compress_level=0
+            )
+
+        frames_pattern = os.path.join(frames_dir, "frame_%05d.png")
+
+        # Шаг 1: генерируем оптимальную палитру из всех кадров
+        cmd_palette = [
+            "ffmpeg", "-y",
+            "-framerate", str(fps),
+            "-i", frames_pattern,
+            "-vf", f"scale={size}:{size}:flags=lanczos,palettegen=max_colors=256:reserve_transparent=1:stats_mode=full",
+            palette,
+        ]
+        r1 = subprocess.run(cmd_palette, capture_output=True, timeout=120)
+        if r1.returncode != 0:
+            logger.error("ffmpeg palettegen error: %s", r1.stderr.decode(errors="replace")[-500:])
             return None
 
-        buf = io.BytesIO()
-        frames[0].save(buf, format="GIF", save_all=True, append_images=frames[1:],
-                       loop=0, duration=duration_ms, optimize=False)
-        return buf.getvalue()
+        # Шаг 2: кодируем GIF с палитрой и дизерингом sierra2_4a (лучшее для анимации)
+        cmd_gif = [
+            "ffmpeg", "-y",
+            "-framerate", str(fps),
+            "-i", frames_pattern,
+            "-i", palette,
+            "-lavfi", f"scale={size}:{size}:flags=lanczos[s];[s][1:v]paletteuse=dither=sierra2_4a:diff_mode=rectangle",
+            gif_path,
+        ]
+        r2 = subprocess.run(cmd_gif, capture_output=True, timeout=180)
+        if r2.returncode != 0:
+            logger.error("ffmpeg gif encode error: %s", r2.stderr.decode(errors="replace")[-500:])
+            return None
 
+        with open(gif_path, "rb") as f:
+            gif_data = f.read()
+
+        logger.info("tgs_to_gif OK: %d кадров, %.1f fps, %dx%d, %d байт",
+                    frame_count, fps, size, size, len(gif_data))
+        return gif_data
+
+    except subprocess.TimeoutExpired:
+        logger.error("tgs_to_gif: ffmpeg timeout")
+        return None
     except Exception as e:
         logger.error("tgs_to_gif error: %s", e, exc_info=True)
         return None
     finally:
-        import shutil
         try:
             shutil.rmtree(tmp_dir, ignore_errors=True)
         except Exception:
