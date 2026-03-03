@@ -536,11 +536,10 @@ def _check_ffmpeg() -> bool:
         return False
 
 
-def tgs_to_mp4(tgs_bytes: bytes, size: int = 1024) -> Optional[bytes]:
+def tgs_to_mp4(tgs_bytes: bytes, size: int = 720) -> Optional[bytes]:
     """
-    Конвертирует TGS → MP4 максимального качества.
-    Рендер в 1024px с RGBA, фон чёрный (0,0,0) для Telegram,
-    кодек H.264 High Profile, CRF 10, preset slow, tune animation.
+    Конвертирует TGS → MP4. Баланс качество/скорость:
+    720px рендер, CRF 14, preset faster, High Profile.
     """
     try:
         from rlottie_python import LottieAnimation
@@ -576,11 +575,9 @@ def tgs_to_mp4(tgs_bytes: bytes, size: int = 1024) -> Optional[bytes]:
             if frame_img is None:
                 continue
 
-            # Масштабируем с LANCZOS если нужно
             if frame_img.size != (size, size):
                 frame_img = frame_img.resize((size, size), Image.LANCZOS)
 
-            # Конвертируем RGBA → RGB с чёрным фоном (стандарт Telegram для анимаций)
             if frame_img.mode == "RGBA":
                 bg = Image.new("RGB", (size, size), (0, 0, 0))
                 bg.paste(frame_img, mask=frame_img.split()[3])
@@ -588,7 +585,6 @@ def tgs_to_mp4(tgs_bytes: bytes, size: int = 1024) -> Optional[bytes]:
             elif frame_img.mode != "RGB":
                 frame_img = frame_img.convert("RGB")
 
-            # Сохраняем без сжатия для максимальной скорости чтения ffmpeg
             frame_img.save(
                 os.path.join(frames_dir, f"frame_{i:05d}.png"),
                 format="PNG", compress_level=0
@@ -601,16 +597,13 @@ def tgs_to_mp4(tgs_bytes: bytes, size: int = 1024) -> Optional[bytes]:
             "-threads", str(cpu_count),
             "-framerate", str(fps),
             "-i", os.path.join(frames_dir, "frame_%05d.png"),
-            # Видео: H.264 High Profile — максимальная совместимость + качество
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
-            "-crf", "10",           # 0=lossless, 10=практически без потерь
-            "-preset", "slow",      # лучшая компрессия = лучшее качество при том же размере
-            "-tune", "animation",   # оптимизация для анимации
-            "-profile:v", "high",   # High Profile — убираем ограничение baseline
-            "-level", "4.2",        # поддерживает 1080p@60fps+
-            # Sharpen filter — компенсирует размытие при масштабировании
-            "-vf", "unsharp=5:5:0.8:3:3:0.4",
+            "-crf", "14",
+            "-preset", "faster",
+            "-tune", "animation",
+            "-profile:v", "high",
+            "-level", "4.1",
             "-movflags", "+faststart",
             mp4_path,
         ]
