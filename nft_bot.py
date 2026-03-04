@@ -241,12 +241,16 @@ def _chat_release(chat_id: int) -> None:
     _chat_active[chat_id] = max(0, count - 1)
 
 
-# ── Кэш сконвертированных видео на диске ─────────────────────────────────────
+# ── Кэш сконвертированных видео на диске — LRU, 20 слотов ────────────────────
 import hashlib
+from collections import OrderedDict
 
-_VIDEO_CACHE_DIR  = os.path.join(tempfile.gettempdir(), "nft_video_cache")
-_VIDEO_CACHE_TTL  = 300.0   # 5 минут
-_video_cache_meta: dict[str, float] = {}   # cache_key -> last_access (monotonic)
+_VIDEO_CACHE_DIR   = os.path.join(tempfile.gettempdir(), "nft_video_cache")
+_VIDEO_CACHE_MAX   = 20      # максимум видео в кэше одновременно
+_VIDEO_CACHE_TTL   = 1200.0  # 20 минут
+# OrderedDict: cache_key -> slug (порядок = порядок добавления, старое в начале)
+_video_cache_lru:  OrderedDict[str, str]   = OrderedDict()
+_video_cache_time: dict[str, float]        = {}  # cache_key -> время добавления
 
 os.makedirs(_VIDEO_CACHE_DIR, exist_ok=True)
 
@@ -258,20 +262,24 @@ def _video_cache_key(slug: str) -> str:
 def _video_cache_get(slug: str) -> Optional[bytes]:
     key  = _video_cache_key(slug)
     path = os.path.join(_VIDEO_CACHE_DIR, f"{key}.mp4")
-    if not os.path.exists(path):
-        _video_cache_meta.pop(key, None)
+    if key not in _video_cache_lru or not os.path.exists(path):
+        _video_cache_lru.pop(key, None)
+        _video_cache_time.pop(key, None)
         return None
+    # Проверяем TTL
     now = time.monotonic()
-    last = _video_cache_meta.get(key, 0.0)
-    if now - last > _VIDEO_CACHE_TTL:
-        _video_cache_meta.pop(key, None)
+    added = _video_cache_time.get(key, 0.0)
+    if now - added > _VIDEO_CACHE_TTL:
+        _video_cache_lru.pop(key, None)
+        _video_cache_time.pop(key, None)
         try:
             os.remove(path)
         except Exception:
             pass
         return None
-    # Продлеваем TTL при обращении
-    _video_cache_meta[key] = now
+    # Продлеваем TTL при обращении и двигаем в конец LRU
+    _video_cache_time[key] = now
+    _video_cache_lru.move_to_end(key)
     try:
         with open(path, "rb") as f:
             return f.read()
@@ -285,22 +293,43 @@ def _video_cache_put(slug: str, data: bytes) -> None:
     try:
         with open(path, "wb") as f:
             f.write(data)
-        _video_cache_meta[key] = time.monotonic()
     except Exception as e:
         logger.warning("video_cache_put error: %s", e)
+        return
+
+    now = time.monotonic()
+    _video_cache_time[key] = now
+
+    if key in _video_cache_lru:
+        _video_cache_lru.move_to_end(key)
+        return
+
+    _video_cache_lru[key] = slug
+
+    # Если превысили лимит — удаляем самое старое
+    while len(_video_cache_lru) > _VIDEO_CACHE_MAX:
+        old_key, old_slug = _video_cache_lru.popitem(last=False)
+        _video_cache_time.pop(old_key, None)
+        old_path = os.path.join(_VIDEO_CACHE_DIR, f"{old_key}.mp4")
+        try:
+            os.remove(old_path)
+            logger.info("🗑 Видео вытеснено из кэша: %s", old_slug)
+        except Exception:
+            pass
 
 
 def _video_cache_cleanup() -> None:
-    """Удаляет устаревшие файлы из кэша."""
-    now = time.monotonic()
-    for key in list(_video_cache_meta.keys()):
-        if now - _video_cache_meta[key] > _VIDEO_CACHE_TTL:
-            path = os.path.join(_VIDEO_CACHE_DIR, f"{key}.mp4")
-            _video_cache_meta.pop(key, None)
-            try:
-                os.remove(path)
-            except Exception:
-                pass
+    """Удаляет файлы кэша которых нет в LRU (мусор после перезапуска)."""
+    known = {f"{k}.mp4" for k in _video_cache_lru}
+    try:
+        for fname in os.listdir(_VIDEO_CACHE_DIR):
+            if fname not in known:
+                try:
+                    os.remove(os.path.join(_VIDEO_CACHE_DIR, fname))
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 # ── Кэш атрибутов NFT ─────────────────────────────────────────────────────────
@@ -1278,10 +1307,6 @@ def get_start_text() -> str:
         "⏱ <b>Повторный показ</b> одного подарка — не чаще <b>1 раза в 2 минуты</b>\n"
         "🔘 <b>Кнопки</b> под превью — только <b>1 раз каждая</b>\n"
         "👥 <b>В чате</b> — не более <b>5 генераций</b> одновременно\n\n"
-        "⚠️ <b>Антиспам:</b>\n"
-        "• 5+ запросов за 30 сек → предупреждение\n"
-        "• 10+ запросов за 30 сек → ограничение на <b>5 минут</b>\n"
-        "• 20+ запросов за минуту → ограничение на <b>1 час</b>\n\n"
         "<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
         "⚡ Видео ~3–6 сек | Картинка ~1–2 сек\n\n"
         "<i>Автор: <a href='https://t.me/balfikovich'>@balfikovich</a></i>"
