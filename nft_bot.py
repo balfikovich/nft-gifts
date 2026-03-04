@@ -2105,32 +2105,46 @@ async def build_profile_pack(message: Message, user: object) -> None:
         parse_mode=ParseMode.HTML,
     )
     try:
-        gifts_result = await bot.get_user_gifts(user_id=uid, limit=100)
+        # aiogram 3.26+: используем метод напрямую через объект запроса
+        from aiogram.methods import GetUserGifts
+        gifts_result = await bot(GetUserGifts(user_id=uid, limit=100))
+    except ImportError:
+        await safe_delete(wm)
+        await message.answer(
+            "❌ <b>Требуется обновление библиотеки.</b>\n\n"
+            "Выполни на сервере:\n<code>pip install -U aiogram</code>\n\n"
+            "Метод <code>getUserGifts</code> доступен с версии <b>3.26</b>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
     except Exception as e:
         await safe_delete(wm)
         err_str = str(e)
-        if "GIFTS_PRIVATE" in err_str or "privacy" in err_str.lower():
+        if any(x in err_str for x in ("GIFTS_PRIVACY", "privacy", "USER_PRIVACY", "forbidden")):
             await message.answer(
-                "🔒 <b>Список подарков скрыт.</b>\n\n"
-                "Чтобы создать стикерпак, откройте список NFT подарков в настройках:\n"
+                "🔒 <b>Список подарков скрыт настройками приватности.</b>\n\n"
+                "Чтобы создать стикерпак:\n"
                 "<b>Настройки → Конфиденциальность → Подарки → Все</b>",
                 parse_mode=ParseMode.HTML,
             )
         else:
             await message.answer(
-                f"❌ <b>Не удалось получить список подарков.</b>\n<i>{e}</i>",
+                f"❌ <b>Не удалось получить список подарков.</b>\n\n<i>{e}</i>",
                 parse_mode=ParseMode.HTML,
             )
         return
 
-    # Фильтруем только уникальные NFT (у них есть slug / sticker)
+    # Извлекаем TGS sticker.file_id только из UNIQUE (NFT) подарков
+    # OwnedGiftUnique: g.type == "unique", g.gift = UniqueGift, g.gift.sticker = Sticker
     nft_gifts = []
     if gifts_result and hasattr(gifts_result, "gifts"):
         for g in gifts_result.gifts:
-            # OwnedGiftUnique имеет gift.sticker (TGS file_id)
-            gift_obj = getattr(g, "gift", None)
-            if gift_obj and hasattr(gift_obj, "sticker") and gift_obj.sticker:
-                nft_gifts.append(gift_obj.sticker.file_id)
+            if str(getattr(g, "type", "")).lower() == "unique":
+                unique_gift = getattr(g, "gift", None)
+                if unique_gift:
+                    sticker = getattr(unique_gift, "sticker", None)
+                    if sticker and getattr(sticker, "file_id", None):
+                        nft_gifts.append(sticker.file_id)
 
     if not nft_gifts:
         await safe_delete(wm)
@@ -2161,6 +2175,8 @@ async def build_profile_pack(message: Message, user: object) -> None:
         try:
             if i == 0 and not pack_already_exists:
                 ok = await _create_sticker_set(uid, pack_name, pack_title, file_id)
+                if ok:
+                    pack_already_exists = True
             else:
                 ok = await _add_sticker_to_set(uid, pack_name, file_id)
 
