@@ -11,14 +11,18 @@ NFT Gift Viewer Bot
 """
 
 import asyncio
+import hashlib
 import io
 import logging
+import multiprocessing
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import time
 import uuid
+from collections import OrderedDict
 from typing import Optional
 
 import aiohttp
@@ -183,17 +187,24 @@ def normalize_gift_name(raw_name: str) -> str:
 #  АНТИСПАМ И СОСТОЯНИЯ
 # ══════════════════════════════════════════════════════════════════════════════
 
-_last_request:           dict[int, float] = {}
-_last_slug:              dict[str, float] = {}
-_cb_lock:                dict[int, bool]  = {}
-_used_no_compress:       set[str]         = set()
-_used_no_anim:           set[str]         = set()
-_used_sticker:           set[str]         = set()
-_used_no_compress_video: set[str]         = set()
-_used_gif:               set[str]         = set()
-_awaiting_donate:        set[int]         = set()
-_last_instr:             dict[int, float] = {}
-_last_button:            dict[str, float] = {}
+_last_request:           dict[int, float]      = {}
+_last_slug:              dict[str, float]       = {}
+_cb_locks:               dict[int, asyncio.Lock] = {}   # asyncio.Lock на пользователя
+_used_no_compress:       set[str]               = set()
+_used_no_anim:           set[str]               = set()
+_used_sticker:           set[str]               = set()
+_used_no_compress_video: set[str]               = set()
+_used_gif:               set[str]               = set()
+_awaiting_donate:        set[int]               = set()
+_last_instr:             dict[int, float]       = {}
+_last_button:            dict[str, float]       = {}
+
+
+def _get_cb_lock(uid: int) -> asyncio.Lock:
+    """Возвращает asyncio.Lock для конкретного пользователя (создаёт если нет)."""
+    if uid not in _cb_locks:
+        _cb_locks[uid] = asyncio.Lock()
+    return _cb_locks[uid]
 
 ANTISPAM_INSTR_SEC  = 300
 ANTISPAM_BUTTON_SEC = 90.0
@@ -219,8 +230,8 @@ SPAM_MUTE_SHORT   = 300.0  # 5 минут
 SPAM_MUTE_LONG    = 3600.0 # 1 час
 SPAM_IDLE_NOTIFY  = 60.0   # секунд тишины → отправить уведомление о муте
 
-# ── Семафор конвертации (не более 3 ffmpeg одновременно) ──────────────────────
-_convert_semaphore = asyncio.Semaphore(3)
+# ── Семафор конвертации (не более 5 ffmpeg одновременно) ─────────────────────
+_convert_semaphore = asyncio.Semaphore(5)
 
 # ── Лимит параллельных генераций в чате ──────────────────────────────────────
 _chat_active: dict[int, int] = {}   # chat_id -> кол-во активных генераций
@@ -242,8 +253,6 @@ def _chat_release(chat_id: int) -> None:
 
 
 # ── Кэш сконвертированных видео на диске — LRU, 20 слотов ────────────────────
-import hashlib
-from collections import OrderedDict
 
 _VIDEO_CACHE_DIR   = os.path.join(tempfile.gettempdir(), "nft_video_cache")
 _VIDEO_CACHE_MAX   = 20      # максимум видео в кэше одновременно
@@ -396,6 +405,10 @@ async def _background_cleanup() -> None:
                       _used_no_compress_video, _used_gif):
                 if len(s) > 5000:
                     s.clear()
+            # _cb_locks — удаляем незанятые локи для освобождения памяти
+            for uid in list(_cb_locks):
+                if not _cb_locks[uid].locked():
+                    del _cb_locks[uid]
             logger.info("🧹 Очистка завершена | spam_muted=%d | attrs_cache=%d | video_cache=%d",
                         len(_spam_muted), len(_attrs_cache), len(_video_cache_meta))
         except Exception as e:
@@ -843,8 +856,6 @@ def tgs_to_mp4(tgs_bytes: bytes, size: int = 720) -> Optional[bytes]:
         logger.error("tgs_to_mp4: не хватает библиотеки: %s", e)
         return None
 
-    import shutil, multiprocessing
-
     tmp_dir    = tempfile.mkdtemp(prefix="nft_mp4_")
     tgs_path   = os.path.join(tmp_dir, "anim.tgs")
     mp4_path   = os.path.join(tmp_dir, "out.mp4")
@@ -940,8 +951,6 @@ def tgs_to_gif(tgs_bytes: bytes, size: int = 800) -> Optional[bytes]:
     except ImportError as e:
         logger.error("tgs_to_gif: не хватает библиотеки: %s", e)
         return None
-
-    import shutil
 
     tmp_dir    = tempfile.mkdtemp(prefix="nft_gif_")
     tgs_path   = os.path.join(tmp_dir, "anim.tgs")
@@ -1538,6 +1547,61 @@ async def cmd_cancel_donate(message: Message) -> None:
         await message.answer("Нет активного ожидания оплаты. Всё в порядке! 😊")
 
 
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message) -> None:
+    """Статистика бота — только для администратора."""
+    if not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+
+    now = time.monotonic()
+
+    # Активные муты
+    active_mutes = sum(1 for until in _spam_muted.values() if now < until)
+
+    # Видео кэш
+    video_cached = len(_video_cache_lru)
+
+    # Атрибуты кэш
+    attrs_cached = len(_attrs_cache)
+
+    # Активные задачи asyncio
+    tasks = len(asyncio.all_tasks())
+
+    # Семафор — свободных слотов
+    sem_free = _convert_semaphore._value
+
+    # Активные чаты
+    active_chats = sum(1 for v in _chat_active.values() if v > 0)
+
+    # Cb locks
+    active_locks = sum(1 for lock in _cb_locks.values() if lock.locked())
+
+    import sys
+    mem_mb = 0
+    try:
+        import resource
+        mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
+    except Exception:
+        pass
+
+    text = (
+        "📊 <b>Статистика бота</b>\n"
+        "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
+        f"🎬 <b>Видео кэш:</b> <code>{video_cached}/{_VIDEO_CACHE_MAX}</code> слотов\n"
+        f"📦 <b>Attrs кэш:</b> <code>{attrs_cached}</code> записей\n"
+        f"⚙️ <b>Семафор:</b> <code>{sem_free}/5</code> свободных слотов\n"
+        f"🚫 <b>Активных мутов:</b> <code>{active_mutes}</code>\n"
+        f"👥 <b>Активных чатов:</b> <code>{active_chats}</code>\n"
+        f"🔒 <b>Активных lock'ов:</b> <code>{active_locks}</code>\n"
+        f"⚡ <b>Asyncio задач:</b> <code>{tasks}</code>\n"
+        f"💾 <b>RAM (RSS):</b> <code>{mem_mb} MB</code>\n"
+        "<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
+        f"<i>_used sets:</i> nc={len(_used_no_compress)} na={len(_used_no_anim)} "
+        f"sk={len(_used_sticker)} gif={len(_used_gif)}"
+    )
+    await message.answer(text, parse_mode=ParseMode.HTML)
+
+
 # ── Callback: «Поддержать автора» ────────────────────────────────────────────
 @dp.callback_query(F.data == CB_DONATE)
 async def callback_donate(callback: CallbackQuery) -> None:
@@ -1603,6 +1667,11 @@ async def payment_handler(message: Message) -> None:
 #  CALLBACKS
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _fmt_wait(wait: float) -> str:
+    mins = int(wait) // 60; secs = int(wait) % 60
+    return f"{mins} мин {secs} сек" if mins else f"{secs} сек"
+
+
 @dp.callback_query(F.data.startswith(CB_NO_COMPRESS_VIDEO))
 async def callback_no_compress_video(callback: CallbackQuery) -> None:
     uid  = callback.from_user.id
@@ -1610,48 +1679,60 @@ async def callback_no_compress_video(callback: CallbackQuery) -> None:
     mid  = callback.message.message_id
     key  = f"{mid}:{slug.lower()}"
 
+    # Проверяем спам на кнопки
+    spam = check_spam_progressive(uid)
+    if spam in ("muted", "ban", "mute"):
+        await callback.answer("⏳ Слишком много запросов. Подожди немного.", show_alert=True)
+        return
+
     if key in _used_no_compress_video:
         await callback.answer("❌ Видео без сжатия уже было отправлено!", show_alert=True)
         return
 
     wait = check_button_antispam(uid, CB_NO_COMPRESS_VIDEO)
     if wait > 0:
-        mins = int(wait) // 60; secs = int(wait) % 60
-        ts = f"{mins} мин {secs} сек" if mins else f"{secs} сек"
-        await callback.answer(f"⏳ Подожди ещё {ts}", show_alert=False)
+        await callback.answer(f"⏳ Подожди ещё {_fmt_wait(wait)}", show_alert=False)
         return
 
-    if _cb_lock.get(uid):
+    lock = _get_cb_lock(uid)
+    if lock.locked():
         await callback.answer("⏳ Идёт загрузка…", show_alert=False)
         return
 
-    _cb_lock[uid] = True
-    await callback.answer("⏳ Загружаю оригинал…")
-
-    try:
-        found, tgs_data, err = await fetch_nft_tgs(slug)
-        if err or not found:
-            await callback.message.answer(f"❌ Не удалось загрузить: {err or 'файл не найден'}")
-            return
-
-        wm = await callback.message.answer("⚙️ Конвертирую в видео без сжатия…")
+    async with lock:
+        await callback.answer("⏳ Загружаю оригинал…")
         try:
-            mp4_data = await asyncio.wait_for(
-                asyncio.to_thread(tgs_to_mp4, tgs_data), timeout=120.0)
-        except asyncio.TimeoutError:
-            mp4_data = None
-        await safe_delete(wm)
+            # Берём из кэша если есть
+            mp4_data = _video_cache_get(slug)
+            if not mp4_data:
+                found, tgs_data, err = await fetch_nft_tgs(slug)
+                if err or not found:
+                    await callback.message.answer(f"❌ Не удалось загрузить: {err or 'файл не найден'}")
+                    return
+                wm = await callback.message.answer("⚙️ Конвертирую в видео…")
+                try:
+                    async with _convert_semaphore:
+                        mp4_data = await asyncio.wait_for(
+                            asyncio.to_thread(tgs_to_mp4, tgs_data), timeout=180.0)
+                    if mp4_data:
+                        _video_cache_put(slug, mp4_data)
+                except asyncio.TimeoutError:
+                    mp4_data = None
+                finally:
+                    await safe_delete(wm)
 
-        if not mp4_data:
-            await callback.message.answer("❌ Не удалось конвертировать видео.")
-            return
+            if not mp4_data:
+                await callback.message.answer("❌ Не удалось конвертировать видео.")
+                return
 
-        _used_no_compress_video.add(key)
-        await remove_keyboard_button(callback.message, CB_NO_COMPRESS_VIDEO)
-        await send_document(callback.message.answer_document, mp4_data, f"{slug}.mp4")
-        user_log.info("📤 БЕЗ СЖАТИЯ ВИДЕО | slug=%s | %s", slug, _u(callback.from_user))
-    finally:
-        _cb_lock[uid] = False
+            _used_no_compress_video.add(key)
+            await remove_keyboard_button(callback.message, CB_NO_COMPRESS_VIDEO)
+            await send_document(callback.message.answer_document, mp4_data, f"{slug}.mp4")
+            user_log.info("📤 БЕЗ СЖАТИЯ ВИДЕО | slug=%s | %s", slug, _u(callback.from_user))
+        except TelegramForbiddenError:
+            pass
+        except Exception as e:
+            logger.error("callback_no_compress_video: %s", e, exc_info=True)
 
 
 @dp.callback_query(F.data.startswith(CB_SEND_GIF))
@@ -1661,49 +1742,59 @@ async def callback_send_gif(callback: CallbackQuery) -> None:
     mid  = callback.message.message_id
     key  = f"{mid}:{slug.lower()}"
 
+    spam = check_spam_progressive(uid)
+    if spam in ("muted", "ban", "mute"):
+        await callback.answer("⏳ Слишком много запросов. Подожди немного.", show_alert=True)
+        return
+
     if key in _used_gif:
         await callback.answer("❌ GIF уже был отправлен!", show_alert=True)
         return
 
     wait = check_button_antispam(uid, CB_SEND_GIF)
     if wait > 0:
-        mins = int(wait) // 60; secs = int(wait) % 60
-        ts = f"{mins} мин {secs} сек" if mins else f"{secs} сек"
-        await callback.answer(f"⏳ Подожди ещё {ts}", show_alert=False)
+        await callback.answer(f"⏳ Подожди ещё {_fmt_wait(wait)}", show_alert=False)
         return
 
-    if _cb_lock.get(uid):
+    lock = _get_cb_lock(uid)
+    if lock.locked():
         await callback.answer("⏳ Идёт загрузка…", show_alert=False)
         return
 
-    _cb_lock[uid] = True
-    await callback.answer("⏳ Загружаю…")
-
-    try:
-        found, tgs_data, err = await fetch_nft_tgs(slug)
-        if err or not found:
-            await callback.message.answer(f"❌ Не удалось загрузить: {err or 'файл не найден'}")
-            return
-
-        wm = await callback.message.answer("⚙️ Конвертирую…")
+    async with lock:
+        await callback.answer("⏳ Загружаю…")
         try:
-            mp4_data = await asyncio.wait_for(
-                asyncio.to_thread(tgs_to_mp4, tgs_data), timeout=120.0)
-        except asyncio.TimeoutError:
-            mp4_data = None
-        await safe_delete(wm)
+            mp4_data = _video_cache_get(slug)
+            if not mp4_data:
+                found, tgs_data, err = await fetch_nft_tgs(slug)
+                if err or not found:
+                    await callback.message.answer(f"❌ Не удалось загрузить: {err or 'файл не найден'}")
+                    return
+                wm = await callback.message.answer("⚙️ Конвертирую…")
+                try:
+                    async with _convert_semaphore:
+                        mp4_data = await asyncio.wait_for(
+                            asyncio.to_thread(tgs_to_mp4, tgs_data), timeout=180.0)
+                    if mp4_data:
+                        _video_cache_put(slug, mp4_data)
+                except asyncio.TimeoutError:
+                    mp4_data = None
+                finally:
+                    await safe_delete(wm)
 
-        if not mp4_data:
-            await callback.message.answer("❌ Не удалось конвертировать.")
-            return
+            if not mp4_data:
+                await callback.message.answer("❌ Не удалось конвертировать.")
+                return
 
-        _used_gif.add(key)
-        await remove_keyboard_button(callback.message, CB_SEND_GIF)
-        file = BufferedInputFile(mp4_data, filename=f"{slug}.mp4")
-        await callback.message.answer_animation(animation=file)
-        user_log.info("🎞 GIF | slug=%s | %s", slug, _u(callback.from_user))
-    finally:
-        _cb_lock[uid] = False
+            _used_gif.add(key)
+            await remove_keyboard_button(callback.message, CB_SEND_GIF)
+            file = BufferedInputFile(mp4_data, filename=f"{slug}.mp4")
+            await callback.message.answer_animation(animation=file)
+            user_log.info("🎞 GIF | slug=%s | %s", slug, _u(callback.from_user))
+        except TelegramForbiddenError:
+            pass
+        except Exception as e:
+            logger.error("callback_send_gif: %s", e, exc_info=True)
 
 
 @dp.callback_query(F.data.startswith(CB_NO_COMPRESS))
@@ -1713,45 +1804,50 @@ async def callback_no_compress(callback: CallbackQuery) -> None:
     mid  = callback.message.message_id
     key  = f"{mid}:{slug.lower()}"
 
-    if _cb_lock.get(uid):
-        await callback.answer("⏳ Идёт загрузка…", show_alert=False)
+    spam = check_spam_progressive(uid)
+    if spam in ("muted", "ban", "mute"):
+        await callback.answer("⏳ Слишком много запросов. Подожди немного.", show_alert=True)
         return
 
     wait = check_button_antispam(uid, CB_NO_COMPRESS)
     if wait > 0:
-        mins = int(wait) // 60; secs = int(wait) % 60
-        ts = f"{mins} мин {secs} сек" if mins else f"{secs} сек"
-        await callback.answer(f"⏳ Подожди ещё {ts}", show_alert=False)
+        await callback.answer(f"⏳ Подожди ещё {_fmt_wait(wait)}", show_alert=False)
         return
 
     if key in _used_no_compress:
         await callback.answer("❌ Оригинал уже был отправлен!", show_alert=True)
         return
 
-    _cb_lock[uid] = True
-    await callback.answer("⏳ Загружаю оригинал…")
+    lock = _get_cb_lock(uid)
+    if lock.locked():
+        await callback.answer("⏳ Идёт загрузка…", show_alert=False)
+        return
 
-    try:
-        found, webp, err = await fetch_nft_image(slug)
-        if err or not found:
-            await callback.message.answer(f"❌ Не удалось загрузить: {err or 'подарок не найден'}")
-            return
-
-        png = webp_to_png(webp)
-        if not png:
-            await send_document(callback.message.answer_document, webp, f"{slug}.webp")
-            return
-
-        _used_no_compress.add(key)
+    async with lock:
+        await callback.answer("⏳ Загружаю оригинал…")
         try:
-            await callback.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
+            found, webp, err = await fetch_nft_image(slug)
+            if err or not found:
+                await callback.message.answer(f"❌ Не удалось загрузить: {err or 'подарок не найден'}")
+                return
 
-        await send_document(callback.message.answer_document, png, f"{slug}.png")
-        user_log.info("📤 БЕЗ СЖАТИЯ (PNG) | slug=%s | %s", slug, _u(callback.from_user))
-    finally:
-        _cb_lock[uid] = False
+            png = webp_to_png(webp)
+            if not png:
+                await send_document(callback.message.answer_document, webp, f"{slug}.webp")
+                return
+
+            _used_no_compress.add(key)
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+
+            await send_document(callback.message.answer_document, png, f"{slug}.png")
+            user_log.info("📤 БЕЗ СЖАТИЯ (PNG) | slug=%s | %s", slug, _u(callback.from_user))
+        except TelegramForbiddenError:
+            pass
+        except Exception as e:
+            logger.error("callback_no_compress: %s", e, exc_info=True)
 
 
 @dp.callback_query(F.data.startswith(CB_NO_ANIM))
@@ -1761,51 +1857,55 @@ async def callback_no_anim(callback: CallbackQuery) -> None:
     mid  = callback.message.message_id
     key  = f"{mid}:{slug.lower()}"
 
+    spam = check_spam_progressive(uid)
+    if spam in ("muted", "ban", "mute"):
+        await callback.answer("⏳ Слишком много запросов. Подожди немного.", show_alert=True)
+        return
+
     if key in _used_no_anim:
         await callback.answer("❌ Картинка уже была отправлена!", show_alert=True)
         return
 
     wait = check_button_antispam(uid, CB_NO_ANIM)
     if wait > 0:
-        mins = int(wait) // 60; secs = int(wait) % 60
-        ts = f"{mins} мин {secs} сек" if mins else f"{secs} сек"
-        await callback.answer(f"⏳ Подожди ещё {ts}", show_alert=False)
+        await callback.answer(f"⏳ Подожди ещё {_fmt_wait(wait)}", show_alert=False)
         return
 
-    if _cb_lock.get(uid):
+    lock = _get_cb_lock(uid)
+    if lock.locked():
         await callback.answer("⏳ Идёт загрузка…", show_alert=False)
         return
 
-    _cb_lock[uid] = True
-    await callback.answer("⏳ Загружаю картинку…")
+    async with lock:
+        await callback.answer("⏳ Загружаю картинку…")
+        try:
+            (found, webp, err), attrs = await asyncio.gather(
+                fetch_nft_image(slug),
+                fetch_nft_attrs(slug),
+            )
+            if err or not found:
+                await callback.message.answer(f"❌ Не удалось загрузить: {err or 'подарок не найден'}")
+                return
 
-    try:
-        (found, webp, err), attrs = await asyncio.gather(
-            fetch_nft_image(slug),
-            fetch_nft_attrs(slug),
-        )
-        if err or not found:
-            await callback.message.answer(f"❌ Не удалось загрузить: {err or 'подарок не найден'}")
-            return
+            png = webp_to_png(webp)
+            if not png:
+                await send_document(callback.message.answer_document, webp, f"{slug}.webp")
+                return
 
-        png = webp_to_png(webp)
-        if not png:
-            await send_document(callback.message.answer_document, webp, f"{slug}.webp")
-            return
+            name_part, _ = split_slug(slug)
+            nice_name = normalize_gift_name(name_part)
+            floor_price, ton_rate = await fetch_floor_price(nice_name)
 
-        name_part, _ = split_slug(slug)
-        nice_name = normalize_gift_name(name_part)
-        floor_price, ton_rate = await fetch_floor_price(nice_name)
-
-        _used_no_anim.add(key)
-        await remove_keyboard_button(callback.message, CB_NO_ANIM)
-        ok = await send_static_photo(callback.message, png, slug, attrs, floor_price, ton_rate)
-        if not ok:
-            await send_document(callback.message.answer_document, png, f"{slug}.png")
-
-        user_log.info("🖼 БЕЗ АНИМАЦИИ | slug=%s | %s", slug, _u(callback.from_user))
-    finally:
-        _cb_lock[uid] = False
+            _used_no_anim.add(key)
+            await remove_keyboard_button(callback.message, CB_NO_ANIM)
+            ok = await send_static_photo(callback.message, png, slug, attrs, floor_price, ton_rate)
+            if not ok:
+                await send_document(callback.message.answer_document, png, f"{slug}.png")
+            user_log.info("🖼 БЕЗ АНИМАЦИИ | slug=%s | %s", slug, _u(callback.from_user))
+        except TelegramForbiddenError:
+            pass
+        except Exception as e:
+            logger.error("callback_no_anim: %s", e, exc_info=True)
 
 
 @dp.callback_query(F.data.startswith(CB_SEND_STICKER))
@@ -1815,39 +1915,43 @@ async def callback_send_sticker(callback: CallbackQuery) -> None:
     mid  = callback.message.message_id
     key  = f"{mid}:{slug.lower()}"
 
+    spam = check_spam_progressive(uid)
+    if spam in ("muted", "ban", "mute"):
+        await callback.answer("⏳ Слишком много запросов. Подожди немного.", show_alert=True)
+        return
+
     if key in _used_sticker:
         await callback.answer("❌ Стикер уже был отправлен!", show_alert=True)
         return
 
     wait = check_button_antispam(uid, CB_SEND_STICKER)
     if wait > 0:
-        mins = int(wait) // 60; secs = int(wait) % 60
-        ts = f"{mins} мин {secs} сек" if mins else f"{secs} сек"
-        await callback.answer(f"⏳ Подожди ещё {ts}", show_alert=False)
+        await callback.answer(f"⏳ Подожди ещё {_fmt_wait(wait)}", show_alert=False)
         return
 
-    if _cb_lock.get(uid):
+    lock = _get_cb_lock(uid)
+    if lock.locked():
         await callback.answer("⏳ Идёт загрузка…", show_alert=False)
         return
 
-    _cb_lock[uid] = True
-    await callback.answer("⏳ Загружаю стикер…")
+    async with lock:
+        await callback.answer("⏳ Загружаю стикер…")
+        try:
+            found, tgs_data, err = await fetch_nft_tgs(slug)
+            if err or not found:
+                await callback.message.answer(f"❌ Не удалось загрузить стикер: {err or 'не найден'}")
+                return
 
-    try:
-        found, tgs_data, err = await fetch_nft_tgs(slug)
-        if err or not found:
-            await callback.message.answer(f"❌ Не удалось загрузить стикер: {err or 'не найден'}")
-            return
-
-        _used_sticker.add(key)
-        await remove_keyboard_button(callback.message, CB_SEND_STICKER)
-
-        ok = await send_tgs_sticker(callback.message, tgs_data, slug)
-        if not ok:
-            await callback.message.answer("❌ Не удалось отправить стикер.")
-        user_log.info("🎭 СТИКЕР | ok=%s | slug=%s | %s", ok, slug, _u(callback.from_user))
-    finally:
-        _cb_lock[uid] = False
+            _used_sticker.add(key)
+            await remove_keyboard_button(callback.message, CB_SEND_STICKER)
+            ok = await send_tgs_sticker(callback.message, tgs_data, slug)
+            if not ok:
+                await callback.message.answer("❌ Не удалось отправить стикер.")
+            user_log.info("🎭 СТИКЕР | ok=%s | slug=%s | %s", ok, slug, _u(callback.from_user))
+        except TelegramForbiddenError:
+            pass
+        except Exception as e:
+            logger.error("callback_send_sticker: %s", e, exc_info=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2301,7 +2405,11 @@ async def _handle_group_video(message: Message, raw: str) -> None:
             logger.info("🎯 VIDEO CACHE HIT | slug=%s", slug)
         else:
             await safe_delete(wm)
-            wm = await message.answer("⚙️ Конвертирую в видео…")
+            # Уведомляем если семафор занят
+            if _convert_semaphore._value == 0:
+                wm = await message.answer("⏳ Сервер занят, ваш запрос в очереди…")
+            else:
+                wm = await message.answer("⚙️ Конвертирую в видео…")
             try:
                 async with _convert_semaphore:
                     mp4_data = await asyncio.wait_for(
@@ -2360,6 +2468,15 @@ async def _handle_private_video(message: Message, raw: str) -> None:
         )
         return
 
+    # Лимит параллельных генераций в личке (через тот же chat_id = uid)
+    if not _chat_acquire(uid):
+        await message.answer(
+            f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
+            "<b>Уже идёт генерация.</b> Дождись результата предыдущего запроса.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     user_log.info("🎬 ЗАПРОС (личка) | slug=%s | %s", slug, _u(message.from_user))
 
     t0 = time.monotonic()
@@ -2368,12 +2485,15 @@ async def _handle_private_video(message: Message, raw: str) -> None:
     name_part, _ = split_slug(slug)
     nice_name = normalize_gift_name(name_part)
 
-    (img_ok, webp, img_err), (tgs_ok, tgs_data, tgs_err), attrs, (floor_price, ton_rate) = await asyncio.gather(
-        fetch_nft_image(slug),
-        fetch_nft_tgs(slug),
-        fetch_nft_attrs(slug),
-        fetch_floor_price(nice_name),
-    )
+    try:
+        (img_ok, webp, img_err), (tgs_ok, tgs_data, tgs_err), attrs, (floor_price, ton_rate) = await asyncio.gather(
+            fetch_nft_image(slug),
+            fetch_nft_tgs(slug),
+            fetch_nft_attrs(slug),
+            fetch_floor_price(nice_name),
+        )
+    finally:
+        _chat_release(uid)
 
     if not img_ok and not tgs_ok:
         await safe_delete(wm)
@@ -2403,7 +2523,11 @@ async def _handle_private_video(message: Message, raw: str) -> None:
             logger.info("🎯 VIDEO CACHE HIT | slug=%s", slug)
         else:
             await safe_delete(wm)
-            wm = await message.answer("⚙️ Конвертирую в видео…")
+            # Уведомляем если семафор занят
+            if _convert_semaphore._value == 0:
+                wm = await message.answer("⏳ Сервер занят, ваш запрос в очереди…")
+            else:
+                wm = await message.answer("⚙️ Конвертирую в видео…")
             try:
                 async with _convert_semaphore:
                     mp4_data = await asyncio.wait_for(
@@ -2530,7 +2654,7 @@ async def inline_handler(query: InlineQuery) -> None:
         parse_mode=None,
         reply_markup=kbd,
     )
-    await query.answer(results=[result], cache_time=60, is_personal=False)
+    await query.answer(results=[result], cache_time=30, is_personal=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
