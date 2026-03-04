@@ -410,7 +410,7 @@ async def _background_cleanup() -> None:
                 if not _cb_locks[uid].locked():
                     del _cb_locks[uid]
             logger.info("🧹 Очистка завершена | spam_muted=%d | attrs_cache=%d | video_cache=%d",
-                        len(_spam_muted), len(_attrs_cache), len(_video_cache_meta))
+                        len(_spam_muted), len(_attrs_cache), len(_video_cache_lru))
         except Exception as e:
             logger.error("_background_cleanup error: %s", e)
 
@@ -2121,7 +2121,7 @@ async def handle_text(message: Message) -> None:
                     raw = raw[len(prefix):].strip()
                     break
             spam = record_spam_event(uid)
-            if _handle_spam_result(spam, uid, message):
+            if await _handle_spam_result(spam, uid, message):
                 return
             await _handle_group_gif_only(message, raw)
             return
@@ -2134,7 +2134,7 @@ async def handle_text(message: Message) -> None:
                     raw = raw[len(prefix):].strip()
                     break
             spam = record_spam_event(uid)
-            if _handle_spam_result(spam, uid, message):
+            if await _handle_spam_result(spam, uid, message):
                 return
             await _handle_group_tgs_only(message, raw)
             return
@@ -2146,7 +2146,7 @@ async def handle_text(message: Message) -> None:
                     raw = raw[len(prefix):].strip()
                     break
             spam = record_spam_event(uid)
-            if _handle_spam_result(spam, uid, message):
+            if await _handle_spam_result(spam, uid, message):
                 return
             await _handle_group_video(message, raw)
             return
@@ -2158,7 +2158,7 @@ async def handle_text(message: Message) -> None:
                     raw = raw[len(prefix):].strip()
                     break
             spam = record_spam_event(uid)
-            if _handle_spam_result(spam, uid, message):
+            if await _handle_spam_result(spam, uid, message):
                 return
             await _handle_group_static(message, raw)
             return
@@ -2167,7 +2167,7 @@ async def handle_text(message: Message) -> None:
 
     # ── ЛИЧКА ─────────────────────────────────────────────────────────────────
     spam = record_spam_event(uid)
-    if _handle_spam_result(spam, uid, message):
+    if await _handle_spam_result(spam, uid, message):
         return
     await _handle_private_video(message, raw)
 
