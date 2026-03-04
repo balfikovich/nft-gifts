@@ -410,7 +410,7 @@ async def _background_cleanup() -> None:
                 if not _cb_locks[uid].locked():
                     del _cb_locks[uid]
             logger.info("🧹 Очистка завершена | spam_muted=%d | attrs_cache=%d | video_cache=%d",
-                        len(_spam_muted), len(_attrs_cache), len(_video_cache_lru))
+                        len(_spam_muted), len(_attrs_cache), len(_video_cache_meta))
         except Exception as e:
             logger.error("_background_cleanup error: %s", e)
 
