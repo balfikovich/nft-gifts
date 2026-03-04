@@ -419,13 +419,28 @@ async def _background_cleanup() -> None:
 
 def check_spam_progressive(uid: int) -> Optional[str]:
     """
-    Возвращает None если запрос разрешён.
-    Возвращает строку-причину если нужно игнорировать запрос.
-    Побочный эффект: записывает запрос в историю.
+    Проверяет только мут — не записывает запрос в историю.
+    Для записи используй record_spam_event(uid).
+    """
+    now = time.monotonic()
+    muted_until = _spam_muted.get(uid)
+    if muted_until is not None:
+        if now < muted_until:
+            return "muted"
+        else:
+            del _spam_muted[uid]
+    return None
+
+
+def record_spam_event(uid: int) -> Optional[str]:
+    """
+    Записывает событие запроса и возвращает результат проверки:
+    None — OK, "warn" — предупреждение, "mute" — 5 мин, "ban" — 1 час.
+    Вызывается ТОЛЬКО при реальных запросах к боту (текст + кнопки).
     """
     now = time.monotonic()
 
-    # Проверяем мут
+    # Если уже в муте — просто возвращаем статус без записи
     muted_until = _spam_muted.get(uid)
     if muted_until is not None:
         if now < muted_until:
@@ -433,30 +448,24 @@ def check_spam_progressive(uid: int) -> Optional[str]:
         else:
             del _spam_muted[uid]
 
-    # Записываем запрос
     history = _spam_history.setdefault(uid, [])
     history.append(now)
 
-    # Считаем запросы в коротком окне (30 сек)
     recent_short = [t for t in history if now - t <= SPAM_WINDOW_SHORT]
-    # Считаем запросы в длинном окне (60 сек)
     recent_long  = [t for t in history if now - t <= SPAM_WINDOW_LONG]
-    _spam_history[uid] = recent_long  # обрезаем историю
+    _spam_history[uid] = recent_long
 
     count_short = len(recent_short)
     count_long  = len(recent_long)
 
-    # Жёсткий бан: 20+ за минуту → 1 час мута
     if count_long >= SPAM_BAN_THRESH:
         _spam_muted[uid] = now + SPAM_MUTE_LONG
         return "ban"
 
-    # Мут: 10+ за 30 сек → 5 минут
     if count_short >= SPAM_MUTE_THRESH:
         _spam_muted[uid] = now + SPAM_MUTE_SHORT
         return "mute"
 
-    # Предупреждение: 5+ за 30 сек
     if count_short >= SPAM_WARN_THRESH:
         last_warn = _spam_warned.get(uid, 0.0)
         if now - last_warn > SPAM_WINDOW_SHORT:
@@ -1680,7 +1689,7 @@ async def callback_no_compress_video(callback: CallbackQuery) -> None:
     key  = f"{mid}:{slug.lower()}"
 
     # Проверяем спам на кнопки
-    spam = check_spam_progressive(uid)
+    spam = record_spam_event(uid)
     if spam in ("muted", "ban", "mute"):
         await callback.answer("⏳ Слишком много запросов. Подожди немного.", show_alert=True)
         return
@@ -1742,7 +1751,7 @@ async def callback_send_gif(callback: CallbackQuery) -> None:
     mid  = callback.message.message_id
     key  = f"{mid}:{slug.lower()}"
 
-    spam = check_spam_progressive(uid)
+    spam = record_spam_event(uid)
     if spam in ("muted", "ban", "mute"):
         await callback.answer("⏳ Слишком много запросов. Подожди немного.", show_alert=True)
         return
@@ -1804,7 +1813,7 @@ async def callback_no_compress(callback: CallbackQuery) -> None:
     mid  = callback.message.message_id
     key  = f"{mid}:{slug.lower()}"
 
-    spam = check_spam_progressive(uid)
+    spam = record_spam_event(uid)
     if spam in ("muted", "ban", "mute"):
         await callback.answer("⏳ Слишком много запросов. Подожди немного.", show_alert=True)
         return
@@ -1857,7 +1866,7 @@ async def callback_no_anim(callback: CallbackQuery) -> None:
     mid  = callback.message.message_id
     key  = f"{mid}:{slug.lower()}"
 
-    spam = check_spam_progressive(uid)
+    spam = record_spam_event(uid)
     if spam in ("muted", "ban", "mute"):
         await callback.answer("⏳ Слишком много запросов. Подожди немного.", show_alert=True)
         return
@@ -1915,7 +1924,7 @@ async def callback_send_sticker(callback: CallbackQuery) -> None:
     mid  = callback.message.message_id
     key  = f"{mid}:{slug.lower()}"
 
-    spam = check_spam_progressive(uid)
+    spam = record_spam_event(uid)
     if spam in ("muted", "ban", "mute"):
         await callback.answer("⏳ Слишком много запросов. Подожди немного.", show_alert=True)
         return
@@ -1954,6 +1963,70 @@ async def callback_send_sticker(callback: CallbackQuery) -> None:
             logger.error("callback_send_sticker: %s", e, exc_info=True)
 
 
+# ── Вспомогательная функция обработки результата спам-проверки ───────────────
+
+async def _handle_spam_result(spam: Optional[str], uid: int, message: Message) -> bool:
+    """
+    Возвращает True если запрос нужно заблокировать (бот ответил или промолчал).
+    Возвращает False если запрос разрешён.
+    """
+    if spam is None:
+        return False
+    if spam == "muted":
+        now = time.monotonic()
+        last_notif = _spam_mute_notified.get(uid, 0.0)
+        if now - last_notif >= SPAM_IDLE_NOTIFY:
+            _spam_mute_notified[uid] = now
+            remaining = get_spam_mute_remaining(uid)
+            if remaining:
+                mins, secs = remaining // 60, remaining % 60
+                ts = f"{mins} мин {secs} сек" if mins else f"{secs} сек"
+                try:
+                    await message.answer(
+                        f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
+                        f"<b>Спам обнаружен.</b>\n\nПовторите запрос через <code>{ts}</code>.",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
+        return True
+    if spam == "ban":
+        user_log.warning("🚫 БАН (1ч) | uid=%d", uid)
+        _spam_mute_notified[uid] = time.monotonic()
+        try:
+            await message.answer(
+                f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
+                "<b>Спам обнаружен.</b>\n\nПовторите запрос через <code>1 час</code>.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return True
+    if spam == "mute":
+        user_log.warning("🔇 МУТ (5мин) | uid=%d", uid)
+        _spam_mute_notified[uid] = time.monotonic()
+        try:
+            await message.answer(
+                f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
+                "<b>Спам обнаружен.</b>\n\nПовторите запрос через <code>5 минут</code>.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return True
+    if spam == "warn":
+        try:
+            await message.answer(
+                f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
+                "<b>Слишком много запросов!</b> Сбавь темп.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return False  # при предупреждении запрос всё равно пропускаем
+    return False
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  ОСНОВНОЙ ОБРАБОТЧИК ТЕКСТА
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1967,11 +2040,11 @@ async def handle_text(message: Message) -> None:
     is_private = message.chat.type == "private"
     uid        = message.from_user.id
 
-    # ── ПРОГРЕССИВНЫЙ АНТИСПАМ (везде кроме ввода доната) ────────────────────
+    # ── ПРОГРЕССИВНЫЙ АНТИСПАМ ────────────────────────────────────────────────
+    # Сначала только проверяем мут (без записи в историю)
     if not (is_private and uid in _awaiting_donate):
-        spam_result = check_spam_progressive(uid)
-        if spam_result == "muted":
-            # Молча игнорируем — но раз в минуту напоминаем о муте
+        mute_check = check_spam_progressive(uid)
+        if mute_check == "muted":
             now = time.monotonic()
             last_notif = _spam_mute_notified.get(uid, 0.0)
             if now - last_notif >= SPAM_IDLE_NOTIFY:
@@ -1989,40 +2062,6 @@ async def handle_text(message: Message) -> None:
                     except Exception:
                         pass
             return
-        elif spam_result == "ban":
-            user_log.warning("🚫 БАН (1ч) | %s", _u(message.from_user))
-            _spam_mute_notified[uid] = time.monotonic()
-            try:
-                await message.answer(
-                    f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
-                    "<b>Спам обнаружен.</b>\n\nПовторите запрос через <code>1 час</code>.",
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception:
-                pass
-            return
-        elif spam_result == "mute":
-            user_log.warning("🔇 МУТ (5мин) | %s", _u(message.from_user))
-            _spam_mute_notified[uid] = time.monotonic()
-            try:
-                await message.answer(
-                    f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
-                    "<b>Спам обнаружен.</b>\n\nПовторите запрос через <code>5 минут</code>.",
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception:
-                pass
-            return
-        elif spam_result == "warn":
-            try:
-                await message.answer(
-                    f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
-                    "<b>Слишком много запросов!</b>\nСбавь темп — иначе получишь временное ограничение.",
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception:
-                pass
-            # Не return — запрос всё равно обрабатываем при предупреждении
 
     # ── ДОНАТ: перехватываем ввод суммы ──────────────────────────────────────
     if is_private and uid in _awaiting_donate:
@@ -2081,6 +2120,9 @@ async def handle_text(message: Message) -> None:
                 if lower.startswith(prefix):
                     raw = raw[len(prefix):].strip()
                     break
+            spam = record_spam_event(uid)
+            if _handle_spam_result(spam, uid, message):
+                return
             await _handle_group_gif_only(message, raw)
             return
 
@@ -2091,6 +2133,9 @@ async def handle_text(message: Message) -> None:
                 if lower.startswith(prefix):
                     raw = raw[len(prefix):].strip()
                     break
+            spam = record_spam_event(uid)
+            if _handle_spam_result(spam, uid, message):
+                return
             await _handle_group_tgs_only(message, raw)
             return
 
@@ -2100,6 +2145,9 @@ async def handle_text(message: Message) -> None:
                 if lower.startswith(prefix):
                     raw = raw[len(prefix):].strip()
                     break
+            spam = record_spam_event(uid)
+            if _handle_spam_result(spam, uid, message):
+                return
             await _handle_group_video(message, raw)
             return
 
@@ -2109,12 +2157,18 @@ async def handle_text(message: Message) -> None:
                 if lower.startswith(prefix):
                     raw = raw[len(prefix):].strip()
                     break
+            spam = record_spam_event(uid)
+            if _handle_spam_result(spam, uid, message):
+                return
             await _handle_group_static(message, raw)
             return
 
         return
 
     # ── ЛИЧКА ─────────────────────────────────────────────────────────────────
+    spam = record_spam_event(uid)
+    if _handle_spam_result(spam, uid, message):
+        return
     await _handle_private_video(message, raw)
 
 
