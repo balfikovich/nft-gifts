@@ -200,6 +200,238 @@ ANTISPAM_BUTTON_SEC = 90.0
 
 BOT_USERNAME: str = ""
 
+# ── Прогрессивный антиспам ────────────────────────────────────────────────────
+# Храним историю запросов: uid -> list[timestamp]
+_spam_history:   dict[int, list[float]] = {}
+# Когда пользователь в муте: uid -> until (monotonic)
+_spam_muted:     dict[int, float]       = {}
+# Когда последний раз предупреждали: uid -> timestamp
+_spam_warned:    dict[int, float]       = {}
+# Когда последний раз отправили сообщение о муте: uid -> timestamp
+_spam_mute_notified: dict[int, float]   = {}
+
+SPAM_WINDOW_SHORT = 30.0   # секунд — окно для подсчёта быстрых запросов
+SPAM_WINDOW_LONG  = 60.0   # секунд — окно для жёсткого бана
+SPAM_WARN_THRESH  = 5      # запросов за SPAM_WINDOW_SHORT → предупреждение
+SPAM_MUTE_THRESH  = 10     # запросов за SPAM_WINDOW_SHORT → мут 5 минут
+SPAM_BAN_THRESH   = 20     # запросов за SPAM_WINDOW_LONG  → мут 1 час
+SPAM_MUTE_SHORT   = 300.0  # 5 минут
+SPAM_MUTE_LONG    = 3600.0 # 1 час
+SPAM_IDLE_NOTIFY  = 60.0   # секунд тишины → отправить уведомление о муте
+
+# ── Семафор конвертации (не более 3 ffmpeg одновременно) ──────────────────────
+_convert_semaphore = asyncio.Semaphore(3)
+
+# ── Лимит параллельных генераций в чате ──────────────────────────────────────
+_chat_active: dict[int, int] = {}   # chat_id -> кол-во активных генераций
+CHAT_MAX_PARALLEL = 5
+
+
+def _chat_acquire(chat_id: int) -> bool:
+    """Возвращает True если можно начать генерацию в чате, иначе False."""
+    count = _chat_active.get(chat_id, 0)
+    if count >= CHAT_MAX_PARALLEL:
+        return False
+    _chat_active[chat_id] = count + 1
+    return True
+
+
+def _chat_release(chat_id: int) -> None:
+    count = _chat_active.get(chat_id, 0)
+    _chat_active[chat_id] = max(0, count - 1)
+
+
+# ── Кэш сконвертированных видео на диске ─────────────────────────────────────
+import hashlib
+
+_VIDEO_CACHE_DIR  = os.path.join(tempfile.gettempdir(), "nft_video_cache")
+_VIDEO_CACHE_TTL  = 300.0   # 5 минут
+_video_cache_meta: dict[str, float] = {}   # cache_key -> last_access (monotonic)
+
+os.makedirs(_VIDEO_CACHE_DIR, exist_ok=True)
+
+
+def _video_cache_key(slug: str) -> str:
+    return hashlib.md5(slug.lower().encode()).hexdigest()
+
+
+def _video_cache_get(slug: str) -> Optional[bytes]:
+    key  = _video_cache_key(slug)
+    path = os.path.join(_VIDEO_CACHE_DIR, f"{key}.mp4")
+    if not os.path.exists(path):
+        _video_cache_meta.pop(key, None)
+        return None
+    now = time.monotonic()
+    last = _video_cache_meta.get(key, 0.0)
+    if now - last > _VIDEO_CACHE_TTL:
+        _video_cache_meta.pop(key, None)
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        return None
+    # Продлеваем TTL при обращении
+    _video_cache_meta[key] = now
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except Exception:
+        return None
+
+
+def _video_cache_put(slug: str, data: bytes) -> None:
+    key  = _video_cache_key(slug)
+    path = os.path.join(_VIDEO_CACHE_DIR, f"{key}.mp4")
+    try:
+        with open(path, "wb") as f:
+            f.write(data)
+        _video_cache_meta[key] = time.monotonic()
+    except Exception as e:
+        logger.warning("video_cache_put error: %s", e)
+
+
+def _video_cache_cleanup() -> None:
+    """Удаляет устаревшие файлы из кэша."""
+    now = time.monotonic()
+    for key in list(_video_cache_meta.keys()):
+        if now - _video_cache_meta[key] > _VIDEO_CACHE_TTL:
+            path = os.path.join(_VIDEO_CACHE_DIR, f"{key}.mp4")
+            _video_cache_meta.pop(key, None)
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+
+# ── Кэш атрибутов NFT ─────────────────────────────────────────────────────────
+_attrs_cache:     dict[str, tuple[object, float]] = {}  # slug -> (NftAttrs, timestamp)
+_ATTRS_CACHE_TTL = 600.0   # 10 минут
+
+
+def _attrs_cache_get(slug: str) -> Optional[object]:
+    entry = _attrs_cache.get(slug)
+    if entry is None:
+        return None
+    attrs, ts = entry
+    if time.monotonic() - ts > _ATTRS_CACHE_TTL:
+        del _attrs_cache[slug]
+        return None
+    return attrs
+
+
+def _attrs_cache_put(slug: str, attrs: object) -> None:
+    _attrs_cache[slug] = (attrs, time.monotonic())
+
+
+# ── Фоновая очистка (каждый час) ─────────────────────────────────────────────
+async def _background_cleanup() -> None:
+    """Периодически чистит все словари состояний от устаревших записей."""
+    while True:
+        await asyncio.sleep(3600)
+        now = time.monotonic()
+        try:
+            # _last_request — записи старше 10 минут
+            for uid in list(_last_request):
+                if now - _last_request[uid] > 600:
+                    del _last_request[uid]
+            # _last_slug — старше 15 минут
+            for k in list(_last_slug):
+                if now - _last_slug[k] > 900:
+                    del _last_slug[k]
+            # _last_instr
+            for k in list(_last_instr):
+                if now - _last_instr[k] > 600:
+                    del _last_instr[k]
+            # _last_button
+            for k in list(_last_button):
+                if now - _last_button[k] > 600:
+                    del _last_button[k]
+            # _spam_history — убираем старые окна
+            for uid in list(_spam_history):
+                _spam_history[uid] = [t for t in _spam_history[uid] if now - t < SPAM_WINDOW_LONG + 10]
+                if not _spam_history[uid]:
+                    del _spam_history[uid]
+            # _spam_muted — истёкшие муты
+            for uid in list(_spam_muted):
+                if now >= _spam_muted[uid]:
+                    del _spam_muted[uid]
+            # _attrs_cache
+            for slug in list(_attrs_cache):
+                _, ts = _attrs_cache[slug]
+                if now - ts > _ATTRS_CACHE_TTL:
+                    del _attrs_cache[slug]
+            # video cache
+            _video_cache_cleanup()
+            # _used_* sets — очищаем если накопилось много
+            for s in (_used_no_compress, _used_no_anim, _used_sticker,
+                      _used_no_compress_video, _used_gif):
+                if len(s) > 5000:
+                    s.clear()
+            logger.info("🧹 Очистка завершена | spam_muted=%d | attrs_cache=%d | video_cache=%d",
+                        len(_spam_muted), len(_attrs_cache), len(_video_cache_meta))
+        except Exception as e:
+            logger.error("_background_cleanup error: %s", e)
+
+
+# ── Прогрессивная антиспам проверка ──────────────────────────────────────────
+
+def check_spam_progressive(uid: int) -> Optional[str]:
+    """
+    Возвращает None если запрос разрешён.
+    Возвращает строку-причину если нужно игнорировать запрос.
+    Побочный эффект: записывает запрос в историю.
+    """
+    now = time.monotonic()
+
+    # Проверяем мут
+    muted_until = _spam_muted.get(uid)
+    if muted_until is not None:
+        if now < muted_until:
+            return "muted"
+        else:
+            del _spam_muted[uid]
+
+    # Записываем запрос
+    history = _spam_history.setdefault(uid, [])
+    history.append(now)
+
+    # Считаем запросы в коротком окне (30 сек)
+    recent_short = [t for t in history if now - t <= SPAM_WINDOW_SHORT]
+    # Считаем запросы в длинном окне (60 сек)
+    recent_long  = [t for t in history if now - t <= SPAM_WINDOW_LONG]
+    _spam_history[uid] = recent_long  # обрезаем историю
+
+    count_short = len(recent_short)
+    count_long  = len(recent_long)
+
+    # Жёсткий бан: 20+ за минуту → 1 час мута
+    if count_long >= SPAM_BAN_THRESH:
+        _spam_muted[uid] = now + SPAM_MUTE_LONG
+        return "ban"
+
+    # Мут: 10+ за 30 сек → 5 минут
+    if count_short >= SPAM_MUTE_THRESH:
+        _spam_muted[uid] = now + SPAM_MUTE_SHORT
+        return "mute"
+
+    # Предупреждение: 5+ за 30 сек
+    if count_short >= SPAM_WARN_THRESH:
+        last_warn = _spam_warned.get(uid, 0.0)
+        if now - last_warn > SPAM_WINDOW_SHORT:
+            _spam_warned[uid] = now
+            return "warn"
+
+    return None
+
+
+def get_spam_mute_remaining(uid: int) -> Optional[int]:
+    """Возвращает сколько секунд осталось в муте, или None."""
+    muted_until = _spam_muted.get(uid)
+    if muted_until is None:
+        return None
+    remaining = int(muted_until - time.monotonic())
+    return remaining if remaining > 0 else None
+
 
 def check_antispam(user_id: int) -> float:
     now  = time.monotonic()
@@ -343,6 +575,11 @@ def _extract_rarity(cell) -> tuple[str, str]:
 
 
 async def fetch_nft_attrs(slug: str) -> NftAttrs:
+    # Проверяем кэш
+    cached = _attrs_cache_get(slug)
+    if cached is not None:
+        return cached  # type: ignore
+
     attrs = NftAttrs()
     url   = f"https://t.me/nft/{slug}"
     hdrs  = {
@@ -416,6 +653,7 @@ async def fetch_nft_attrs(slug: str) -> NftAttrs:
     except Exception as e:
         logger.warning("fetch_attrs error | slug=%s | %s", slug, e)
 
+    _attrs_cache_put(slug, attrs)
     return attrs
 
 
@@ -1035,9 +1273,15 @@ def get_start_text() -> str:
         "🎬 <b>Анимация MP4:</b> <code>+а превью Plush Pepe 22</code>\n"
         "🎞 <b>Только GIF:</b> <code>+гиф превью Plush Pepe 22</code>\n"
         "🎭 <b>TGS файл:</b> <code>+тгс превью Plush Pepe 22</code>\n\n"
-        "<b>📋 Правила в группе:</b>\n"
-        "• Повтор одного подарка — не чаще <b>1 раза в 5 минут</b>\n"
-        "• Кнопки под превью — только 1 раз каждая\n\n"
+        "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
+        "<b>📋 Правила пользования:</b>\n\n"
+        "⏱ <b>Повторный показ</b> одного подарка — не чаще <b>1 раза в 2 минуты</b>\n"
+        "🔘 <b>Кнопки</b> под превью — только <b>1 раз каждая</b>\n"
+        "👥 <b>В чате</b> — не более <b>5 генераций</b> одновременно\n\n"
+        "⚠️ <b>Антиспам:</b>\n"
+        "• 5+ запросов за 30 сек → предупреждение\n"
+        "• 10+ запросов за 30 сек → ограничение на <b>5 минут</b>\n"
+        "• 20+ запросов за минуту → ограничение на <b>1 час</b>\n\n"
         "<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
         "⚡ Видео ~3–6 сек | Картинка ~1–2 сек\n\n"
         "<i>Автор: <a href='https://t.me/balfikovich'>@balfikovich</a></i>"
@@ -1594,6 +1838,63 @@ async def handle_text(message: Message) -> None:
     is_private = message.chat.type == "private"
     uid        = message.from_user.id
 
+    # ── ПРОГРЕССИВНЫЙ АНТИСПАМ (везде кроме ввода доната) ────────────────────
+    if not (is_private and uid in _awaiting_donate):
+        spam_result = check_spam_progressive(uid)
+        if spam_result == "muted":
+            # Молча игнорируем — но раз в минуту напоминаем о муте
+            now = time.monotonic()
+            last_notif = _spam_mute_notified.get(uid, 0.0)
+            if now - last_notif >= SPAM_IDLE_NOTIFY:
+                _spam_mute_notified[uid] = now
+                remaining = get_spam_mute_remaining(uid)
+                if remaining:
+                    mins, secs = remaining // 60, remaining % 60
+                    ts = f"{mins} мин {secs} сек" if mins else f"{secs} сек"
+                    try:
+                        await message.answer(
+                            f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
+                            f"<b>Спам обнаружен.</b>\n\nПовторите запрос через <code>{ts}</code>.",
+                            parse_mode=ParseMode.HTML,
+                        )
+                    except Exception:
+                        pass
+            return
+        elif spam_result == "ban":
+            user_log.warning("🚫 БАН (1ч) | %s", _u(message.from_user))
+            _spam_mute_notified[uid] = time.monotonic()
+            try:
+                await message.answer(
+                    f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
+                    "<b>Спам обнаружен.</b>\n\nПовторите запрос через <code>1 час</code>.",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+            return
+        elif spam_result == "mute":
+            user_log.warning("🔇 МУТ (5мин) | %s", _u(message.from_user))
+            _spam_mute_notified[uid] = time.monotonic()
+            try:
+                await message.answer(
+                    f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
+                    "<b>Спам обнаружен.</b>\n\nПовторите запрос через <code>5 минут</code>.",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+            return
+        elif spam_result == "warn":
+            try:
+                await message.answer(
+                    f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
+                    "<b>Слишком много запросов!</b>\nСбавь темп — иначе получишь временное ограничение.",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+            # Не return — запрос всё равно обрабатываем при предупреждении
+
     # ── ДОНАТ: перехватываем ввод суммы ──────────────────────────────────────
     if is_private and uid in _awaiting_donate:
         s = raw.strip()
@@ -1731,11 +2032,18 @@ async def _handle_group_gif_only(message: Message, raw: str) -> None:
     await safe_delete(wm)
     wm = await message.answer("⚙️ Конвертирую в GIF…")
 
-    try:
-        mp4_data = await asyncio.wait_for(
-            asyncio.to_thread(tgs_to_mp4, tgs_data), timeout=120.0)
-    except asyncio.TimeoutError:
-        mp4_data = None
+    mp4_data = _video_cache_get(slug)
+    if mp4_data:
+        logger.info("🎯 VIDEO CACHE HIT (gif) | slug=%s", slug)
+    else:
+        try:
+            async with _convert_semaphore:
+                mp4_data = await asyncio.wait_for(
+                    asyncio.to_thread(tgs_to_mp4, tgs_data), timeout=180.0)
+            if mp4_data:
+                _video_cache_put(slug, mp4_data)
+        except asyncio.TimeoutError:
+            mp4_data = None
 
     await safe_delete(wm)
 
@@ -1834,17 +2142,28 @@ async def _handle_group_static(message: Message, raw: str) -> None:
         )
         return
 
+    if not _chat_acquire(message.chat.id):
+        await message.answer(
+            f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
+            f"<b>Чат занят.</b> Сейчас обрабатывается {CHAT_MAX_PARALLEL} запросов. Попробуй чуть позже.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     t0 = time.monotonic()
     wm = await message.answer("🔍 Загружаю…", parse_mode=ParseMode.HTML)
 
     name_part, _ = split_slug(extract_nft_slug(raw) or raw)
     nice_name = normalize_gift_name(name_part)
 
-    (found, webp, err), attrs, (floor_price, ton_rate) = await asyncio.gather(
-        fetch_nft_image(slug),
-        fetch_nft_attrs(slug),
-        fetch_floor_price(nice_name),
-    )
+    try:
+        (found, webp, err), attrs, (floor_price, ton_rate) = await asyncio.gather(
+            fetch_nft_image(slug),
+            fetch_nft_attrs(slug),
+            fetch_floor_price(nice_name),
+        )
+    finally:
+        _chat_release(message.chat.id)
     elapsed = round(time.monotonic() - t0, 2)
     await safe_delete(wm)
 
@@ -1908,18 +2227,29 @@ async def _handle_group_video(message: Message, raw: str) -> None:
         )
         return
 
+    if not _chat_acquire(message.chat.id):
+        await message.answer(
+            f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
+            f"<b>Чат занят.</b> Сейчас обрабатывается {CHAT_MAX_PARALLEL} запросов. Попробуй чуть позже.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     t0 = time.monotonic()
     wm = await message.answer("🔍 Загружаю данные…")
 
     name_part, _ = split_slug(slug)
     nice_name = normalize_gift_name(name_part)
 
-    (img_ok, webp, img_err), (tgs_ok, tgs_data, tgs_err), attrs, (floor_price, ton_rate) = await asyncio.gather(
-        fetch_nft_image(slug),
-        fetch_nft_tgs(slug),
-        fetch_nft_attrs(slug),
-        fetch_floor_price(nice_name),
-    )
+    try:
+        (img_ok, webp, img_err), (tgs_ok, tgs_data, tgs_err), attrs, (floor_price, ton_rate) = await asyncio.gather(
+            fetch_nft_image(slug),
+            fetch_nft_tgs(slug),
+            fetch_nft_attrs(slug),
+            fetch_floor_price(nice_name),
+        )
+    finally:
+        _chat_release(message.chat.id)
 
     if not img_ok and not tgs_ok:
         await safe_delete(wm)
@@ -1940,13 +2270,21 @@ async def _handle_group_video(message: Message, raw: str) -> None:
 
     mp4_data: Optional[bytes] = None
     if tgs_ok and tgs_data:
-        await safe_delete(wm)
-        wm = await message.answer("⚙️ Конвертирую в видео…")
-        try:
-            mp4_data = await asyncio.wait_for(
-                asyncio.to_thread(tgs_to_mp4, tgs_data), timeout=120.0)
-        except asyncio.TimeoutError:
-            mp4_data = None
+        # Проверяем кэш
+        mp4_data = _video_cache_get(slug)
+        if mp4_data:
+            logger.info("🎯 VIDEO CACHE HIT | slug=%s", slug)
+        else:
+            await safe_delete(wm)
+            wm = await message.answer("⚙️ Конвертирую в видео…")
+            try:
+                async with _convert_semaphore:
+                    mp4_data = await asyncio.wait_for(
+                        asyncio.to_thread(tgs_to_mp4, tgs_data), timeout=180.0)
+                if mp4_data:
+                    _video_cache_put(slug, mp4_data)
+            except asyncio.TimeoutError:
+                mp4_data = None
 
     await safe_delete(wm)
     elapsed = round(time.monotonic() - t0, 2)
@@ -2035,13 +2373,20 @@ async def _handle_private_video(message: Message, raw: str) -> None:
 
     mp4_data: Optional[bytes] = None
     if tgs_ok and tgs_data:
-        await safe_delete(wm)
-        wm = await message.answer("⚙️ Конвертирую в видео…")
-        try:
-            mp4_data = await asyncio.wait_for(
-                asyncio.to_thread(tgs_to_mp4, tgs_data), timeout=120.0)
-        except asyncio.TimeoutError:
-            mp4_data = None
+        mp4_data = _video_cache_get(slug)
+        if mp4_data:
+            logger.info("🎯 VIDEO CACHE HIT | slug=%s", slug)
+        else:
+            await safe_delete(wm)
+            wm = await message.answer("⚙️ Конвертирую в видео…")
+            try:
+                async with _convert_semaphore:
+                    mp4_data = await asyncio.wait_for(
+                        asyncio.to_thread(tgs_to_mp4, tgs_data), timeout=180.0)
+                if mp4_data:
+                    _video_cache_put(slug, mp4_data)
+            except asyncio.TimeoutError:
+                mp4_data = None
 
     await safe_delete(wm)
     elapsed = round(time.monotonic() - t0, 2)
@@ -2172,6 +2517,9 @@ async def on_startup() -> None:
     get_session()
     me = await bot.get_me()
     BOT_USERNAME = me.username or ""
+
+    # Запускаем фоновую очистку
+    asyncio.create_task(_background_cleanup())
 
     logger.info("━" * 60)
     logger.info("✅ БОТ ЗАПУЩЕН: @%s (id=%s)", me.username, me.id)
