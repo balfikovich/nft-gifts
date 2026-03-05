@@ -66,9 +66,9 @@ PREMIUM_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "premium
 TZ_KYIV = ZoneInfo("Europe/Kiev")
 
 # ── Параметры премиум-качества видео ─────────────────────────────────────────
-PREMIUM_VIDEO_SIZE = 1080   # px (vs обычный 720)
-PREMIUM_VIDEO_CRF  = 8      # (vs обычный 14) — практически lossless
-PREMIUM_COOLDOWN   = 900.0  # 15 минут между премиум-запросами
+PREMIUM_VIDEO_SIZE = 2160  # px (vs обычный 720)
+PREMIUM_VIDEO_CRF  = 4      # (vs обычный 14) — практически lossless
+PREMIUM_COOLDOWN   = 600  # 15 минут между премиум-запросами
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ЛОГИРОВАНИЕ
