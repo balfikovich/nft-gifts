@@ -262,45 +262,158 @@ _premium_users: set[int] = set()           # uid -> True (числовые ID)
 _premium_pending: set[str] = set()         # username (lowercase, без @) — ждут первого входа
 _premium_cooldown: dict[int, float] = {}   # uid -> monotonic time последнего премиум-запроса
 
-def _load_premium() -> None:
-    """Загружает список премиум-пользователей из файла."""
+# ID сообщения-хранилища в боте у админа (заполняется при старте)
+_premium_storage_msg_id: Optional[int] = None
+_PREMIUM_STORAGE_MARKER = "⚙️PREMIUM_STORAGE⚙️"  # маркер для поиска сообщения
+
+
+def _premium_to_json() -> str:
+    return json.dumps({
+        "users":   list(_premium_users),
+        "pending": list(_premium_pending),
+    }, ensure_ascii=False)
+
+
+def _premium_from_json(text: str) -> None:
     global _premium_users, _premium_pending
+    try:
+        # Текст сообщения: маркер + "\n" + JSON
+        json_part = text.split("\n", 1)[1] if "\n" in text else text
+        data = json.loads(json_part)
+        _premium_users   = set(data.get("users", []))
+        _premium_pending = set(data.get("pending", []))
+        logger.info("✅ Премиум загружен из Telegram: %d users, %d pending",
+                    len(_premium_users), len(_premium_pending))
+    except Exception as e:
+        logger.error("_premium_from_json error: %s | text=%r", e, text[:200])
+
+
+async def _premium_load_from_telegram() -> None:
+    """Загружает премиум-данные из Telegram: ищет маркерное сообщение у админа."""
+    global _premium_storage_msg_id
+    try:
+        # Ищем последние 100 сообщений от бота самому себе (getUpdates не подходит)
+        # Используем sendMessage + deleteMessage как ping, а хранилище ищем через
+        # специальный forward_message trick — проще хранить msg_id в env
+        msg_id_env = os.environ.get("PREMIUM_MSG_ID", "")
+        if msg_id_env.isdigit():
+            _premium_storage_msg_id = int(msg_id_env)
+            # Пробуем прочитать содержимое через forwardMessage к самому себе
+            try:
+                fwd = await bot.forward_message(
+                    chat_id=ADMIN_ID,
+                    from_chat_id=ADMIN_ID,
+                    message_id=_premium_storage_msg_id,
+                )
+                if fwd and fwd.text and _PREMIUM_STORAGE_MARKER in fwd.text:
+                    _premium_from_json(fwd.text.replace(_PREMIUM_STORAGE_MARKER + "\n", ""))
+                    await bot.delete_message(ADMIN_ID, fwd.message_id)
+                    return
+                else:
+                    await bot.delete_message(ADMIN_ID, fwd.message_id)
+            except Exception as e:
+                logger.warning("_premium_load: forward failed: %s", e)
+
+        # Создаём новое хранилище
+        await _premium_save_to_telegram()
+    except Exception as e:
+        logger.error("_premium_load_from_telegram error: %s", e)
+
+
+async def _premium_save_to_telegram() -> None:
+    """Сохраняет премиум-данные в Telegram-сообщение у админа."""
+    global _premium_storage_msg_id
+    text = f"{_PREMIUM_STORAGE_MARKER}\n{_premium_to_json()}"
+    try:
+        if _premium_storage_msg_id:
+            try:
+                await bot.edit_message_text(
+                    chat_id=ADMIN_ID,
+                    message_id=_premium_storage_msg_id,
+                    text=text,
+                )
+                return
+            except Exception:
+                pass  # сообщение удалено — создаём новое
+        # Создаём новое сообщение-хранилище
+        msg = await bot.send_message(ADMIN_ID, text)
+        _premium_storage_msg_id = msg.message_id
+        logger.info("📦 Создано хранилище премиума: msg_id=%d", msg.message_id)
+        logger.info("💡 Добавь в Railway переменную: PREMIUM_MSG_ID=%d", msg.message_id)
+    except Exception as e:
+        logger.error("_premium_save_to_telegram error: %s", e)
+
+
+# Синхронный fallback на файл (если Telegram недоступен при старте)
+def _load_premium_file() -> None:
     try:
         if os.path.exists(PREMIUM_FILE):
             with open(PREMIUM_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            _premium_users   = set(data.get("users", []))
-            _premium_pending = set(data.get("pending", []))
-            logger.info("✅ Загружено %d премиум-пользователей, %d pending",
-                        len(_premium_users), len(_premium_pending))
-    except Exception as e:
-        logger.error("_load_premium error: %s", e)
+            _premium_users.update(data.get("users", []))
+            _premium_pending.update(data.get("pending", []))
+    except Exception:
+        pass
 
-def _save_premium() -> None:
-    """Сохраняет список премиум-пользователей в файл."""
+
+def _save_premium_file() -> None:
     try:
         with open(PREMIUM_FILE, "w", encoding="utf-8") as f:
-            json.dump({
-                "users":   list(_premium_users),
-                "pending": list(_premium_pending),
-            }, f)
-    except Exception as e:
-        logger.error("_save_premium error: %s", e)
+            json.dump({"users": list(_premium_users), "pending": list(_premium_pending)}, f)
+    except Exception:
+        pass
+
+
+def _save_premium() -> None:
+    """Сохраняет синхронно в файл + запускает async-сохранение в Telegram."""
+    _save_premium_file()
+    # Запускаем async-сохранение если event loop уже есть
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_premium_save_to_telegram())
+    except RuntimeError:
+        pass  # нет event loop — только файл
+
 
 def is_premium(uid: int, username: Optional[str] = None) -> bool:
     if uid == ADMIN_ID or uid in _premium_users:
         return True
-    # Резолвим pending по username если он есть
+    # Резолвим pending по username
     if username and username.lower() in _premium_pending:
         _premium_pending.discard(username.lower())
         _premium_users.add(uid)
         _save_premium()
         logger.info("⭐ PENDING РЕЗОЛВЛЕН: @%s → uid=%d", username, uid)
+        # Уведомляем пользователя асинхронно
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_notify_premium_granted(uid))
+        except RuntimeError:
+            pass
         return True
     return False
 
+
+async def _notify_premium_granted(uid: int) -> None:
+    """Уведомляет пользователя что его pending-премиум активировался."""
+    try:
+        await bot.send_message(
+            uid,
+            f'<tg-emoji emoji-id="{E_PREMIUM}">⭐</tg-emoji> <b>Премиум-доступ активирован!</b>\n'
+            "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
+            "🎉 Ваш доступ к премиум-функциям активирован!\n\n"
+            "<b>Как использовать:</b>\n"
+            "📩 <b>В личке:</b> <code>премиум PlushPepe-22</code>\n"
+            "👥 <b>В чате:</b> <code>+а превью премиум PlushPepe-22</code>\n\n"
+            "⏱ Не чаще <b>1 раза в 15 минут</b>\n\n"
+            "<i>По вопросам: <a href='https://t.me/balfikovich'>@balfikovich</a></i>",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        logger.warning("_notify_premium_granted uid=%d: %s", uid, e)
+
+
 def premium_cooldown_remaining(uid: int) -> float:
-    """Сколько секунд осталось до следующего премиум-запроса. 0 = можно."""
     last = _premium_cooldown.get(uid, 0.0)
     diff = time.monotonic() - last
     return max(0.0, PREMIUM_COOLDOWN - diff)
@@ -1197,9 +1310,9 @@ def tgs_to_mp4_premium(tgs_bytes: bytes) -> Optional[bytes]:
 
         cpu_count = multiprocessing.cpu_count()
 
-        # ffmpeg: максимальное качество x264
-        # CRF 0 = lossless для x264, veryslow = лучшее сжатие/качество
-        # x264-params: ref=16 (максимум), bframes=8, me=umh, subme=11, trellis=2
+        # ffmpeg: максимальное качество x264 совместимое с Railway ffmpeg
+        # CRF 1 (почти lossless, CRF 0 даёт проблемы с некоторыми версиями ffmpeg)
+        # preset slow — лучший баланс качества без x264-params которые могут не поддерживаться
         cmd = [
             "ffmpeg", "-y",
             "-threads", str(cpu_count),
@@ -1207,20 +1320,34 @@ def tgs_to_mp4_premium(tgs_bytes: bytes) -> Optional[bytes]:
             "-i", os.path.join(frames_dir, "frame_%05d.png"),
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
-            "-crf", "0",
-            "-preset", "veryslow",
+            "-crf", "1",
+            "-preset", "slow",
             "-tune", "animation",
             "-profile:v", "high",
-            "-level", "5.1",
-            "-x264-params",
-            "ref=16:bframes=8:me=umh:subme=11:trellis=2:deblock=-1,-1:psy-rd=1.0:aq-mode=3",
+            "-level", "4.2",
             "-movflags", "+faststart",
             mp4_path,
         ]
         result = subprocess.run(cmd, capture_output=True, timeout=600)
         if result.returncode != 0:
             logger.error("ffmpeg premium error: %s", result.stderr.decode(errors="replace")[-800:])
-            return None
+            # Fallback: самые базовые настройки
+            cmd_fallback = [
+                "ffmpeg", "-y",
+                "-framerate", str(fps),
+                "-i", os.path.join(frames_dir, "frame_%05d.png"),
+                "-c:v", "libx264",
+                "-pix_fmt", "yuv420p",
+                "-crf", "1",
+                "-preset", "medium",
+                "-movflags", "+faststart",
+                mp4_path,
+            ]
+            result2 = subprocess.run(cmd_fallback, capture_output=True, timeout=600)
+            if result2.returncode != 0:
+                logger.error("ffmpeg premium fallback error: %s",
+                             result2.stderr.decode(errors="replace")[-400:])
+                return None
 
         with open(mp4_path, "rb") as f:
             mp4_data = f.read()
@@ -3552,8 +3679,9 @@ async def on_startup() -> None:
     me = await bot.get_me()
     BOT_USERNAME = me.username or ""
 
-    # Загружаем премиум-пользователей
-    _load_premium()
+    # Загружаем премиум-пользователей (файл → Telegram)
+    _load_premium_file()  # сначала файл (если есть остаток)
+    await _premium_load_from_telegram()  # потом Telegram (основное хранилище)
 
     # Запускаем фоновую очистку
     asyncio.create_task(_background_cleanup())
