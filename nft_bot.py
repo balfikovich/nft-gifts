@@ -1240,16 +1240,8 @@ def tgs_to_mp4(tgs_bytes: bytes, size: int = 720, crf: int = 14, preset: str = "
 
 def tgs_to_mp4_premium(tgs_bytes: bytes) -> Optional[bytes]:
     """
-    МАКСИМАЛЬНОЕ качество TGS → MP4.
-    Pipeline:
-      1. Рендерим каждый кадр в 2× нативный размер rlottie (обычно 512→1024px)
-         через render_pillow_frame — это максимум без апскейла.
-      2. Lanczos-даунсемплинг до 1080px — суперсемплинг, убирает алиасинг.
-      3. RGBA→RGB с альфа-компоситингом на чёрный фон.
-      4. ffmpeg libx264: preset veryslow, CRF 0 (lossless),
-         -x264-params ref=16:bframes=8:me=umh:subme=11:trellis=2 — максимум.
-      5. Финальный pass: faststart для стриминга.
-    Генерируется ~20–60 сек в зависимости от сервера.
+    Максимальное качество TGS → MP4.
+    800px Lanczos + CRF 1 — лучшее что поддерживает Railway ffmpeg.
     """
     try:
         from rlottie_python import LottieAnimation
@@ -1258,8 +1250,7 @@ def tgs_to_mp4_premium(tgs_bytes: bytes) -> Optional[bytes]:
         logger.error("tgs_to_mp4_premium: не хватает библиотеки: %s", e)
         return None
 
-    RENDER_SIZE = 1024   # рендерим в 2× (нативный max rlottie)
-    OUT_SIZE    = 1080   # финальный размер после Lanczos-даунсемплинга
+    OUT_SIZE = 800  # надёжный размер для Railway ffmpeg
 
     tmp_dir    = tempfile.mkdtemp(prefix="nft_prem_")
     tgs_path   = os.path.join(tmp_dir, "anim.tgs")
@@ -1280,21 +1271,19 @@ def tgs_to_mp4_premium(tgs_bytes: bytes) -> Optional[bytes]:
 
         fps = max(fps, 1)
         os.makedirs(frames_dir, exist_ok=True)
+        saved = 0
 
         for i in range(frame_count):
-            # Рендерим в максимальном размере который поддерживает rlottie
-            frame_img = anim.render_pillow_frame(frame_num=i, width=RENDER_SIZE, height=RENDER_SIZE)
-            if frame_img is None:
-                # Fallback — рендерим в стандартном размере
+            try:
                 frame_img = anim.render_pillow_frame(frame_num=i)
+            except Exception:
+                continue
             if frame_img is None:
                 continue
 
-            # Суперсемплинг: даунскейл Lanczos с 1024 → 1080 (если уже 512 → апскейл)
             if frame_img.size != (OUT_SIZE, OUT_SIZE):
                 frame_img = frame_img.resize((OUT_SIZE, OUT_SIZE), Image.LANCZOS)
 
-            # Альфа-композитинг на чёрный фон
             if frame_img.mode == "RGBA":
                 bg = Image.new("RGB", (OUT_SIZE, OUT_SIZE), (0, 0, 0))
                 bg.paste(frame_img, mask=frame_img.split()[3])
@@ -1302,62 +1291,63 @@ def tgs_to_mp4_premium(tgs_bytes: bytes) -> Optional[bytes]:
             elif frame_img.mode != "RGB":
                 frame_img = frame_img.convert("RGB")
 
-            # Сохраняем без сжатия для максимального качества передачи в ffmpeg
             frame_img.save(
                 os.path.join(frames_dir, f"frame_{i:05d}.png"),
                 format="PNG", compress_level=0,
             )
+            saved += 1
 
-        cpu_count = multiprocessing.cpu_count()
+        if saved == 0:
+            logger.error("tgs_to_mp4_premium: ни один кадр не сохранён")
+            return None
 
-        # ffmpeg: максимальное качество x264 совместимое с Railway ffmpeg
-        # CRF 1 (почти lossless, CRF 0 даёт проблемы с некоторыми версиями ffmpeg)
-        # preset slow — лучший баланс качества без x264-params которые могут не поддерживаться
-        cmd = [
-            "ffmpeg", "-y",
-            "-threads", str(cpu_count),
-            "-framerate", str(fps),
-            "-i", os.path.join(frames_dir, "frame_%05d.png"),
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-crf", "1",
-            "-preset", "slow",
-            "-tune", "animation",
-            "-profile:v", "high",
-            "-level", "4.2",
-            "-movflags", "+faststart",
-            mp4_path,
+        logger.info("tgs_to_mp4_premium: сохранено %d/%d кадров, размер=%dpx",
+                    saved, frame_count, OUT_SIZE)
+
+        # Пробуем от лучшего к простому
+        cmds = [
+            # Попытка 1: CRF 1, slow — почти lossless
+            ["ffmpeg", "-y", "-framerate", str(fps),
+             "-i", os.path.join(frames_dir, "frame_%05d.png"),
+             "-c:v", "libx264", "-pix_fmt", "yuv420p",
+             "-crf", "1", "-preset", "slow", "-tune", "animation",
+             "-movflags", "+faststart", mp4_path],
+            # Попытка 2: CRF 5, medium
+            ["ffmpeg", "-y", "-framerate", str(fps),
+             "-i", os.path.join(frames_dir, "frame_%05d.png"),
+             "-c:v", "libx264", "-pix_fmt", "yuv420p",
+             "-crf", "5", "-preset", "medium",
+             "-movflags", "+faststart", mp4_path],
+            # Попытка 3: самый простой вариант
+            ["ffmpeg", "-y", "-framerate", str(fps),
+             "-i", os.path.join(frames_dir, "frame_%05d.png"),
+             "-c:v", "libx264", "-pix_fmt", "yuv420p",
+             "-crf", "8", mp4_path],
         ]
-        result = subprocess.run(cmd, capture_output=True, timeout=600)
-        if result.returncode != 0:
-            logger.error("ffmpeg premium error: %s", result.stderr.decode(errors="replace")[-800:])
-            # Fallback: самые базовые настройки
-            cmd_fallback = [
-                "ffmpeg", "-y",
-                "-framerate", str(fps),
-                "-i", os.path.join(frames_dir, "frame_%05d.png"),
-                "-c:v", "libx264",
-                "-pix_fmt", "yuv420p",
-                "-crf", "1",
-                "-preset", "medium",
-                "-movflags", "+faststart",
-                mp4_path,
-            ]
-            result2 = subprocess.run(cmd_fallback, capture_output=True, timeout=600)
-            if result2.returncode != 0:
-                logger.error("ffmpeg premium fallback error: %s",
-                             result2.stderr.decode(errors="replace")[-400:])
-                return None
+
+        success = False
+        for attempt, cmd in enumerate(cmds, 1):
+            result = subprocess.run(cmd, capture_output=True, timeout=600)
+            if result.returncode == 0 and os.path.exists(mp4_path) and os.path.getsize(mp4_path) > 0:
+                logger.info("tgs_to_mp4_premium: попытка %d успешна", attempt)
+                success = True
+                break
+            else:
+                logger.warning("tgs_to_mp4_premium попытка %d провалилась: %s",
+                               attempt, result.stderr.decode(errors="replace")[-200:])
+
+        if not success:
+            return None
 
         with open(mp4_path, "rb") as f:
             mp4_data = f.read()
 
-        logger.info("tgs_to_mp4_premium OK: %d кадров, %.1f fps, %dx%d, %d байт",
-                    frame_count, fps, OUT_SIZE, OUT_SIZE, len(mp4_data))
+        logger.info("tgs_to_mp4_premium OK: %d кадров, %.1f fps, %d байт",
+                    frame_count, fps, len(mp4_data))
         return mp4_data
 
     except subprocess.TimeoutExpired:
-        logger.error("tgs_to_mp4_premium: ffmpeg timeout (600s)")
+        logger.error("tgs_to_mp4_premium: timeout")
         return None
     except Exception as e:
         logger.error("tgs_to_mp4_premium error: %s", e, exc_info=True)
