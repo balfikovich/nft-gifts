@@ -13,6 +13,7 @@ NFT Gift Viewer Bot
 import asyncio
 import hashlib
 import io
+import json
 import logging
 import multiprocessing
 import os
@@ -23,7 +24,9 @@ import tempfile
 import time
 import uuid
 from collections import OrderedDict
+from datetime import datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
@@ -55,6 +58,17 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не задан! Создай .env: BOT_TOKEN=xxx")
 
 ADMIN_ID = 5479063264
+
+# ── Файл хранения премиум-пользователей (персистентность) ────────────────────
+PREMIUM_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "premium_users.json")
+
+# ── Таймзона Киев ─────────────────────────────────────────────────────────────
+TZ_KYIV = ZoneInfo("Europe/Kiev")
+
+# ── Параметры премиум-качества видео ─────────────────────────────────────────
+PREMIUM_VIDEO_SIZE = 1080   # px (vs обычный 720)
+PREMIUM_VIDEO_CRF  = 8      # (vs обычный 14) — практически lossless
+PREMIUM_COOLDOWN   = 900.0  # 15 минут между премиум-запросами
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ЛОГИРОВАНИЕ
@@ -103,6 +117,9 @@ CB_SEND_STICKER      = "sk:"
 CB_NO_COMPRESS_VIDEO = "ncv:"
 CB_SEND_GIF          = "gif:"
 CB_DONATE            = "donate"
+CB_ADD_PREMIUM       = "addprem"
+CB_REMOVE_PREMIUM    = "rmprem:"
+CB_EXPIRED           = "expired"   # кнопка истёкшего превью
 
 ANTISPAM_SECONDS  = 1.5
 ANTISPAM_SLUG_SEC = 120
@@ -119,6 +136,8 @@ E_START     = "6028495398941759268"
 E_DONATE    = "5309759985192832914"
 E_FLOOR_GEM = "5409321884074419506"   # 💎 для Floorprice
 E_FLOOR_TON = "5316802593391916971"   # ❤️ для цены TON
+E_PREMIUM   = "5309759985192832914"   # ⭐ премиум-иконка
+E_CROWN     = "5472055112702629499"   # 👑 корона для премиума
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  СЛОВАРЬ ПРАВИЛЬНЫХ НАЗВАНИЙ ПОДАРКОВ
@@ -206,6 +225,89 @@ _processing_slugs:       dict[int, set[str]]    = {}
 _last_completed:         dict[int, float]       = {}
 # Кулдаун между РАЗНЫМИ slug в личке (секунды)
 PRIVATE_SLUG_COOLDOWN = 60.0
+
+# ── Статистика запросов для /stats ────────────────────────────────────────────
+# Хранит последние 50 запросов: list of dict
+_request_log: list[dict] = []
+REQUEST_LOG_MAX = 50
+
+def _log_request(slug: str, user, chat) -> None:
+    """Записывает запрос в лог статистики."""
+    now_kyiv = datetime.now(TZ_KYIV)
+    entry = {
+        "time":       now_kyiv.strftime("%d.%m %H:%M:%S"),
+        "slug":       slug,
+        "user_name":  (user.full_name or "NoName").strip() if user else "unknown",
+        "user_id":    user.id if user else 0,
+        "username":   f"@{user.username}" if (user and user.username) else None,
+        "chat_title": None,
+        "chat_id":    None,
+        "chat_type":  None,
+    }
+    if chat and chat.type != "private":
+        entry["chat_title"] = getattr(chat, "title", None) or "NoTitle"
+        entry["chat_id"]    = chat.id
+        entry["chat_type"]  = chat.type
+        if getattr(chat, "username", None):
+            entry["chat_title"] = f"@{chat.username}"
+    else:
+        entry["chat_type"] = "private"
+
+    _request_log.append(entry)
+    if len(_request_log) > REQUEST_LOG_MAX:
+        _request_log.pop(0)
+
+# ── Премиум-пользователи ──────────────────────────────────────────────────────
+_premium_users: set[int] = set()        # uid -> True
+_premium_cooldown: dict[int, float] = {}  # uid -> monotonic time последнего премиум-запроса
+
+def _load_premium() -> None:
+    """Загружает список премиум-пользователей из файла."""
+    global _premium_users
+    try:
+        if os.path.exists(PREMIUM_FILE):
+            with open(PREMIUM_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            _premium_users = set(data.get("users", []))
+            logger.info("✅ Загружено %d премиум-пользователей", len(_premium_users))
+    except Exception as e:
+        logger.error("_load_premium error: %s", e)
+
+def _save_premium() -> None:
+    """Сохраняет список премиум-пользователей в файл."""
+    try:
+        with open(PREMIUM_FILE, "w", encoding="utf-8") as f:
+            json.dump({"users": list(_premium_users)}, f)
+    except Exception as e:
+        logger.error("_save_premium error: %s", e)
+
+def is_premium(uid: int) -> bool:
+    return uid in _premium_users or uid == ADMIN_ID
+
+def premium_cooldown_remaining(uid: int) -> float:
+    """Сколько секунд осталось до следующего премиум-запроса. 0 = можно."""
+    last = _premium_cooldown.get(uid, 0.0)
+    diff = time.monotonic() - last
+    return max(0.0, PREMIUM_COOLDOWN - diff)
+
+# ── Истекающие превью ─────────────────────────────────────────────────────────
+# msg_key (chat_id:msg_id) -> expire_monotonic
+_preview_expire: dict[str, float] = {}
+PREVIEW_TTL = 900.0   # 15 минут
+
+def _preview_key(chat_id: int, msg_id: int) -> str:
+    return f"{chat_id}:{msg_id}"
+
+def _preview_register(chat_id: int, msg_id: int) -> None:
+    key = _preview_key(chat_id, msg_id)
+    _preview_expire[key] = time.monotonic() + PREVIEW_TTL
+
+def _preview_is_active(chat_id: int, msg_id: int) -> bool:
+    key = _preview_key(chat_id, msg_id)
+    exp = _preview_expire.get(key)
+    if exp is None:
+        return True   # старые сообщения до обновления — пропускаем
+    return time.monotonic() < exp
 
 
 def _get_cb_lock(uid: int) -> asyncio.Lock:
@@ -416,6 +518,14 @@ async def _background_cleanup() -> None:
                     del _attrs_cache[slug]
             # video cache
             _video_cache_cleanup()
+            # _preview_expire — удаляем истёкшие
+            for k in list(_preview_expire):
+                if now > _preview_expire[k] + 3600:   # чистим через час после истечения
+                    del _preview_expire[k]
+            # _premium_cooldown — удаляем истёкшие
+            for uid in list(_premium_cooldown):
+                if now - _premium_cooldown[uid] > PREMIUM_COOLDOWN + 60:
+                    del _premium_cooldown[uid]
             # _used_* sets — очищаем если накопилось много
             for s in (_used_no_compress, _used_no_anim, _used_sticker,
                       _used_no_compress_video, _used_gif):
@@ -905,10 +1015,11 @@ def _check_ffmpeg() -> bool:
         return False
 
 
-def tgs_to_mp4(tgs_bytes: bytes, size: int = 720) -> Optional[bytes]:
+def tgs_to_mp4(tgs_bytes: bytes, size: int = 720, crf: int = 14, preset: str = "faster") -> Optional[bytes]:
     """
     Конвертирует TGS → MP4. Баланс качество/скорость:
     720px рендер, CRF 14, preset faster, High Profile.
+    Для премиум: size=1080, crf=8, preset=slow.
     """
     try:
         from rlottie_python import LottieAnimation
@@ -966,8 +1077,8 @@ def tgs_to_mp4(tgs_bytes: bytes, size: int = 720) -> Optional[bytes]:
             "-i", os.path.join(frames_dir, "frame_%05d.png"),
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
-            "-crf", "14",
-            "-preset", "faster",
+            "-crf", str(crf),
+            "-preset", preset,
             "-tune", "animation",
             "-profile:v", "high",
             "-level", "4.1",
@@ -997,6 +1108,15 @@ def tgs_to_mp4(tgs_bytes: bytes, size: int = 720) -> Optional[bytes]:
             shutil.rmtree(tmp_dir, ignore_errors=True)
         except Exception:
             pass
+
+
+def tgs_to_mp4_premium(tgs_bytes: bytes) -> Optional[bytes]:
+    """
+    Премиум конвертация TGS → MP4.
+    1080px, CRF 8 (почти lossless), preset slow.
+    Дольше, но максимальное качество изображения.
+    """
+    return tgs_to_mp4(tgs_bytes, size=PREMIUM_VIDEO_SIZE, crf=PREMIUM_VIDEO_CRF, preset="slow")
 
 
 def tgs_to_gif(tgs_bytes: bytes, size: int = 800) -> Optional[bytes]:
@@ -1284,21 +1404,23 @@ def make_caption(slug: str, attrs: NftAttrs,
 
 # ── Клавиатуры ────────────────────────────────────────────────────────────────
 
-def make_keyboard_static(slug: str) -> InlineKeyboardMarkup:
+def make_keyboard_static(slug: str, expire_ts: int = 0) -> InlineKeyboardMarkup:
+    ts = expire_ts or int(time.time() + PREVIEW_TTL)
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="📤 Отправить без сжатия",
-                             callback_data=f"{CB_NO_COMPRESS}{slug}")
+                             callback_data=f"{CB_NO_COMPRESS}{slug}|{ts}")
     ]])
 
 
-def make_keyboard_video(slug: str) -> InlineKeyboardMarkup:
+def make_keyboard_video(slug: str, expire_ts: int = 0) -> InlineKeyboardMarkup:
+    ts = expire_ts or int(time.time() + PREVIEW_TTL)
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎞 Отправить как GIF",
-                              callback_data=f"{CB_SEND_GIF}{slug}")],
+                              callback_data=f"{CB_SEND_GIF}{slug}|{ts}")],
         [InlineKeyboardButton(text="🖼 Без анимации (PNG)",
-                              callback_data=f"{CB_NO_ANIM}{slug}")],
+                              callback_data=f"{CB_NO_ANIM}{slug}|{ts}")],
         [InlineKeyboardButton(text="🎭 Отправить стикер (TGS)",
-                              callback_data=f"{CB_SEND_STICKER}{slug}")],
+                              callback_data=f"{CB_SEND_STICKER}{slug}|{ts}")],
     ])
 
 
@@ -1394,6 +1516,12 @@ async def safe_delete(msg: Message) -> None:
         pass
 
 
+async def _delayed_delete(msg: Message, delay: float = 10.0) -> None:
+    """Удаляет сообщение через delay секунд (фоновая задача)."""
+    await asyncio.sleep(delay)
+    await safe_delete(msg)
+
+
 async def remove_keyboard_button(msg: Message, remove_prefix: str) -> None:
     try:
         kbd = msg.reply_markup
@@ -1416,27 +1544,34 @@ async def remove_keyboard_button(msg: Message, remove_prefix: str) -> None:
 async def send_static_photo(message: Message, png: bytes,
                             slug: str, attrs: NftAttrs,
                             floor_price: Optional[float] = None,
-                            ton_rate: Optional[float] = None) -> bool:
+                            ton_rate: Optional[float] = None,
+                            reply_to: Optional[int] = None) -> bool:
     caption, ents = make_caption(slug, attrs, floor_price, ton_rate)
-    kbd  = make_keyboard_static(slug)
+    expire_ts = int(time.time() + PREVIEW_TTL)
+    kbd  = make_keyboard_static(slug, expire_ts)
     file = BufferedInputFile(png, filename=f"{slug}.png")
+    kwargs = dict(
+        photo=file,
+        caption=caption,
+        caption_entities=ents,
+        parse_mode=None,
+        reply_markup=kbd,
+    )
+    if reply_to:
+        kwargs["reply_to_message_id"] = reply_to
     try:
-        await message.answer_photo(
-            photo=file,
-            caption=caption,
-            caption_entities=ents,
-            parse_mode=None,
-            reply_markup=kbd,
-        )
+        sent = await message.answer_photo(**kwargs)
+        if sent:
+            _preview_register(sent.chat.id, sent.message_id)
         return True
     except TelegramRetryAfter as e:
         await asyncio.sleep(e.retry_after)
         try:
             file = BufferedInputFile(png, filename=f"{slug}.png")
-            await message.answer_photo(
-                photo=file, caption=caption, caption_entities=ents,
-                parse_mode=None, reply_markup=kbd,
-            )
+            kwargs["photo"] = file
+            sent = await message.answer_photo(**kwargs)
+            if sent:
+                _preview_register(sent.chat.id, sent.message_id)
             return True
         except Exception as ex:
             logger.error("send_static_photo retry: %s", ex)
@@ -1452,28 +1587,35 @@ async def send_static_photo(message: Message, png: bytes,
 async def send_video(message: Message, mp4: bytes,
                      slug: str, attrs: NftAttrs,
                      floor_price: Optional[float] = None,
-                     ton_rate: Optional[float] = None) -> bool:
+                     ton_rate: Optional[float] = None,
+                     reply_to: Optional[int] = None) -> bool:
     caption, ents = make_caption(slug, attrs, floor_price, ton_rate)
-    kbd  = make_keyboard_video(slug)
+    expire_ts = int(time.time() + PREVIEW_TTL)
+    kbd  = make_keyboard_video(slug, expire_ts)
     file = BufferedInputFile(mp4, filename=f"{slug}.mp4")
+    kwargs = dict(
+        video=file,
+        caption=caption,
+        caption_entities=ents,
+        parse_mode=None,
+        reply_markup=kbd,
+        supports_streaming=True,
+    )
+    if reply_to:
+        kwargs["reply_to_message_id"] = reply_to
     try:
-        await message.answer_video(
-            video=file,
-            caption=caption,
-            caption_entities=ents,
-            parse_mode=None,
-            reply_markup=kbd,
-            supports_streaming=True,
-        )
+        sent = await message.answer_video(**kwargs)
+        if sent:
+            _preview_register(sent.chat.id, sent.message_id)
         return True
     except TelegramRetryAfter as e:
         await asyncio.sleep(e.retry_after)
         try:
             file = BufferedInputFile(mp4, filename=f"{slug}.mp4")
-            await message.answer_video(
-                video=file, caption=caption, caption_entities=ents,
-                parse_mode=None, reply_markup=kbd, supports_streaming=True,
-            )
+            kwargs["video"] = file
+            sent = await message.answer_video(**kwargs)
+            if sent:
+                _preview_register(sent.chat.id, sent.message_id)
             return True
         except Exception as ex:
             logger.error("send_video retry: %s", ex)
@@ -1608,6 +1750,54 @@ async def cmd_cancel_donate(message: Message) -> None:
         await message.answer("Нет активного ожидания оплаты. Всё в порядке! 😊")
 
 
+@dp.message(Command("cancel_premium"))
+async def cmd_cancel_premium(message: Message) -> None:
+    """Отмена ввода юзернейма для премиума."""
+    if message.from_user and message.from_user.id == ADMIN_ID:
+        _awaiting_premium_input.discard(ADMIN_ID)
+        _awaiting_remove_premium.discard(ADMIN_ID)
+        await message.answer("✅ Отменено.")
+
+
+@dp.message(Command("premium"))
+async def cmd_premium_status(message: Message) -> None:
+    """Показывает статус премиума пользователя."""
+    if message.chat.type != "private":
+        return
+    uid = message.from_user.id
+    if is_premium(uid):
+        rem = premium_cooldown_remaining(uid)
+        cooldown_text = ""
+        if rem > 0:
+            m, s = int(rem) // 60, int(rem) % 60
+            cooldown_text = f"\n\n⏱ До следующего запроса: <code>{m} мин {s} сек</code>"
+        await message.answer(
+            f'<tg-emoji emoji-id="{E_PREMIUM}">⭐</tg-emoji> <b>У вас есть премиум-доступ!</b>\n'
+            "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
+            "✨ Вам доступна команда <b>премиум</b> для генерации видео в максимальном качестве.\n\n"
+            "<b>Как использовать:</b>\n"
+            "📩 В личке: просто напишите <code>премиум</code> + ссылку или название\n"
+            "👥 В чате: <code>+а превью премиум PlushPepe-22</code>\n\n"
+            "<b>Условия:</b>\n"
+            "• Не чаще <b>1 раза в 15 минут</b>\n"
+            "• Разрешение <b>1080px</b> (обычное — 720px)\n"
+            "• Качество <b>CRF 8</b> (обычное — CRF 14)\n"
+            "• Генерация занимает <b>дольше обычного</b> (~10–20 сек)"
+            f"{cooldown_text}",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await message.answer(
+            f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> <b>Премиум-функции</b>\n'
+            "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
+            "🔒 У вас нет доступа к премиум-функциям.\n\n"
+            "Это команда премиум пользователей <i>(тестовая версия)</i>\n\n"
+            "Если вы хотите получить тестовые возможности премиума — напишите "
+            "<a href='https://t.me/balfikovich'>@balfikovich</a>.",
+            parse_mode=ParseMode.HTML,
+        )
+
+
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message) -> None:
     """Статистика бота — только для администратора."""
@@ -1616,28 +1806,15 @@ async def cmd_stats(message: Message) -> None:
 
     now = time.monotonic()
 
-    # Активные муты
-    active_mutes = sum(1 for until in _spam_muted.values() if now < until)
+    active_mutes  = sum(1 for until in _spam_muted.values() if now < until)
+    video_cached  = len(_video_cache_lru)
+    attrs_cached  = len(_attrs_cache)
+    tasks         = len(asyncio.all_tasks())
+    sem_free      = _convert_semaphore._value
+    active_chats  = sum(1 for v in _chat_active.values() if v > 0)
+    active_locks  = sum(1 for lock in _cb_locks.values() if lock.locked())
+    premium_count = len(_premium_users)
 
-    # Видео кэш
-    video_cached = len(_video_cache_lru)
-
-    # Атрибуты кэш
-    attrs_cached = len(_attrs_cache)
-
-    # Активные задачи asyncio
-    tasks = len(asyncio.all_tasks())
-
-    # Семафор — свободных слотов
-    sem_free = _convert_semaphore._value
-
-    # Активные чаты
-    active_chats = sum(1 for v in _chat_active.values() if v > 0)
-
-    # Cb locks
-    active_locks = sum(1 for lock in _cb_locks.values() if lock.locked())
-
-    import sys
     mem_mb = 0
     try:
         import resource
@@ -1645,22 +1822,41 @@ async def cmd_stats(message: Message) -> None:
     except Exception:
         pass
 
+    # ── Системная часть ───────────────────────────────────────────────────────
     text = (
         "📊 <b>Статистика бота</b>\n"
         "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
-        f"🎬 <b>Видео кэш:</b> <code>{video_cached}/{_VIDEO_CACHE_MAX}</code> слотов\n"
-        f"📦 <b>Attrs кэш:</b> <code>{attrs_cached}</code> записей\n"
-        f"⚙️ <b>Семафор:</b> <code>{sem_free}/5</code> свободных слотов\n"
-        f"🚫 <b>Активных мутов:</b> <code>{active_mutes}</code>\n"
-        f"👥 <b>Активных чатов:</b> <code>{active_chats}</code>\n"
-        f"🔒 <b>Активных lock'ов:</b> <code>{active_locks}</code>\n"
+        f"🎬 <b>Видео кэш:</b> <code>{video_cached}/{_VIDEO_CACHE_MAX}</code>\n"
+        f"📦 <b>Attrs кэш:</b> <code>{attrs_cached}</code>\n"
+        f"⚙️ <b>Семафор:</b> <code>{sem_free}/5</code> слотов\n"
+        f"🚫 <b>Мутов:</b> <code>{active_mutes}</code>\n"
+        f"👥 <b>Чатов активно:</b> <code>{active_chats}</code>\n"
+        f"🔒 <b>Локов:</b> <code>{active_locks}</code>\n"
         f"⚡ <b>Asyncio задач:</b> <code>{tasks}</code>\n"
-        f"💾 <b>RAM (RSS):</b> <code>{mem_mb} MB</code>\n"
-        "<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
-        f"<i>_used sets:</i> nc={len(_used_no_compress)} na={len(_used_no_anim)} "
-        f"sk={len(_used_sticker)} gif={len(_used_gif)}"
+        f"💾 <b>RAM:</b> <code>{mem_mb} MB</code>\n"
+        f"⭐ <b>Премиум польз.:</b> <code>{premium_count}</code>\n"
+        "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
     )
-    await message.answer(text, parse_mode=ParseMode.HTML)
+
+    # ── Последние запросы ─────────────────────────────────────────────────────
+    if _request_log:
+        text += "🕐 <b>Последние запросы:</b>\n"
+        for entry in reversed(_request_log[-20:]):
+            who = entry["username"] or entry["user_name"]
+            where = ""
+            if entry["chat_type"] != "private":
+                chat_name = entry.get("chat_title") or f"id={entry['chat_id']}"
+                where = f" в {chat_name}"
+            text += f"<blockquote>{entry['time']} — <code>{entry['slug']}</code>\n{who}{where}</blockquote>\n"
+    else:
+        text += "<i>Запросов пока нет</i>\n"
+
+    # ── Кнопка добавления премиума ────────────────────────────────────────────
+    kbd = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="⭐ Добавить премиум-пользователя",
+                             callback_data=CB_ADD_PREMIUM)
+    ]])
+    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kbd)
 
 
 # ── Callback: «Поддержать автора» ────────────────────────────────────────────
@@ -1682,6 +1878,88 @@ async def callback_donate(callback: CallbackQuery) -> None:
         "💡 Передумал — напиши <code>/cancel_donate</code>",
         parse_mode=ParseMode.HTML,
     )
+
+
+# ── Callback: «Добавить премиум» (только для админа) ─────────────────────────
+_awaiting_premium_input: set[int] = set()   # uid админа который вводит юзернейм
+_awaiting_remove_premium: set[int] = set()  # uid админа который вводит юзернейм для удаления
+
+@dp.callback_query(F.data == CB_ADD_PREMIUM)
+async def callback_add_premium(callback: CallbackQuery) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Только для администратора.", show_alert=True)
+        return
+    await callback.answer()
+    _awaiting_premium_input.add(callback.from_user.id)
+    await callback.message.answer(
+        "⭐ <b>Добавление премиум-пользователя</b>\n\n"
+        "Введите <b>@username</b> или <b>числовой ID</b> пользователя:\n\n"
+        "<i>Например: <code>@username</code> или <code>123456789</code></i>\n\n"
+        "Отмена — /cancel_premium",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@dp.callback_query(F.data.startswith(CB_REMOVE_PREMIUM))
+async def callback_remove_premium(callback: CallbackQuery) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Только для администратора.", show_alert=True)
+        return
+    uid_str = callback.data[len(CB_REMOVE_PREMIUM):]
+    try:
+        target_uid = int(uid_str)
+    except ValueError:
+        await callback.answer("❌ Ошибка.", show_alert=True)
+        return
+
+    if target_uid in _premium_users:
+        _premium_users.discard(target_uid)
+        _save_premium()
+        await callback.answer("✅ Премиум отозван.", show_alert=True)
+        await callback.message.edit_reply_markup(reply_markup=None)
+        # Уведомляем пользователя
+        try:
+            await bot.send_message(
+                target_uid,
+                f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> <b>Премиум-доступ отозван</b>\n\n'
+                "К сожалению, ваш доступ к премиум-функциям был отозван администратором.\n\n"
+                "По вопросам обращайтесь к "
+                "<a href='https://t.me/balfikovich'>@balfikovich</a>.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        user_log.info("⭐ ПРЕМИУМ ОТОЗВАН | uid=%d | admin=%d", target_uid, ADMIN_ID)
+    else:
+        await callback.answer("ℹ️ Этот пользователь не имеет премиума.", show_alert=True)
+
+
+# ── Callback: истёкшее превью ─────────────────────────────────────────────────
+@dp.callback_query(lambda c: _is_expired_callback(c))
+async def callback_expired_preview(callback: CallbackQuery) -> None:
+    await callback.answer(
+        "⏳ Это превью уже истекло.\nЗапросите информацию об этом подарке ещё раз.",
+        show_alert=True,
+    )
+
+def _is_expired_callback(callback: CallbackQuery) -> bool:
+    """Проверяет все callback'ы с временной меткой — не истекло ли превью."""
+    data = callback.data or ""
+    for prefix in (CB_NO_COMPRESS, CB_NO_ANIM, CB_SEND_STICKER,
+                   CB_NO_COMPRESS_VIDEO, CB_SEND_GIF):
+        if data.startswith(prefix):
+            # Формат: PREFIX + slug + "|" + ts
+            payload = data[len(prefix):]
+            if "|" in payload:
+                _, ts_str = payload.rsplit("|", 1)
+                try:
+                    ts = int(ts_str)
+                    if time.time() > ts:
+                        return True
+                except ValueError:
+                    pass
+            break
+    return False
 
 
 # ── PreCheckout ───────────────────────────────────────────────────────────────
@@ -1736,7 +2014,7 @@ def _fmt_wait(wait: float) -> str:
 @dp.callback_query(F.data.startswith(CB_NO_COMPRESS_VIDEO))
 async def callback_no_compress_video(callback: CallbackQuery) -> None:
     uid  = callback.from_user.id
-    slug = callback.data[len(CB_NO_COMPRESS_VIDEO):]
+    payload = callback.data[len(CB_NO_COMPRESS_VIDEO):]; slug = payload.split("|")[0]
     mid  = callback.message.message_id
     key  = f"{mid}:{slug.lower()}"
 
@@ -1799,7 +2077,7 @@ async def callback_no_compress_video(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data.startswith(CB_SEND_GIF))
 async def callback_send_gif(callback: CallbackQuery) -> None:
     uid  = callback.from_user.id
-    slug = callback.data[len(CB_SEND_GIF):]
+    payload = callback.data[len(CB_SEND_GIF):]; slug = payload.split("|")[0]
     mid  = callback.message.message_id
     key  = f"{mid}:{slug.lower()}"
 
@@ -1861,7 +2139,7 @@ async def callback_send_gif(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data.startswith(CB_NO_COMPRESS))
 async def callback_no_compress(callback: CallbackQuery) -> None:
     uid  = callback.from_user.id
-    slug = callback.data[len(CB_NO_COMPRESS):]
+    payload = callback.data[len(CB_NO_COMPRESS):]; slug = payload.split("|")[0]
     mid  = callback.message.message_id
     key  = f"{mid}:{slug.lower()}"
 
@@ -1914,7 +2192,7 @@ async def callback_no_compress(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data.startswith(CB_NO_ANIM))
 async def callback_no_anim(callback: CallbackQuery) -> None:
     uid  = callback.from_user.id
-    slug = callback.data[len(CB_NO_ANIM):]
+    payload = callback.data[len(CB_NO_ANIM):]; slug = payload.split("|")[0]
     mid  = callback.message.message_id
     key  = f"{mid}:{slug.lower()}"
 
@@ -1972,7 +2250,7 @@ async def callback_no_anim(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data.startswith(CB_SEND_STICKER))
 async def callback_send_sticker(callback: CallbackQuery) -> None:
     uid  = callback.from_user.id
-    slug = callback.data[len(CB_SEND_STICKER):]
+    payload = callback.data[len(CB_SEND_STICKER):]; slug = payload.split("|")[0]
     mid  = callback.message.message_id
     key  = f"{mid}:{slug.lower()}"
 
@@ -2150,12 +2428,81 @@ async def handle_text(message: Message) -> None:
             )
         return
 
+    # ── АДМИН: ввод юзернейма для добавления/удаления премиума ───────────────
+    if uid == ADMIN_ID and uid in _awaiting_premium_input:
+        _awaiting_premium_input.discard(uid)
+        target = raw.strip().lstrip("@")
+        target_uid = None
+        # Числовой ID
+        if target.isdigit():
+            target_uid = int(target)
+        else:
+            # Попытка найти пользователя по username через Telegram (не всегда работает)
+            try:
+                chat_obj = await bot.get_chat(f"@{target}")
+                target_uid = chat_obj.id
+            except Exception:
+                await message.answer(
+                    f"❌ Не удалось найти пользователя <code>@{target}</code>.\n\n"
+                    "Попробуй указать числовой <b>ID</b> пользователя.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+
+        _premium_users.add(target_uid)
+        _save_premium()
+        # Уведомляем пользователя
+        notified = False
+        try:
+            remove_kbd = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="❌ Отозвать премиум",
+                                     callback_data=f"{CB_REMOVE_PREMIUM}{target_uid}")
+            ]])
+            await bot.send_message(
+                target_uid,
+                f'<tg-emoji emoji-id="{E_PREMIUM}">⭐</tg-emoji> <b>Вам выдан премиум-доступ!</b>\n'
+                "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
+                "🎉 Поздравляем! Теперь вам доступна генерация видео в <b>максимальном качестве</b>.\n\n"
+                "<b>Что такое Премиум-превью:</b>\n"
+                "• Разрешение <b>1080px</b> вместо обычных 720px\n"
+                "• Качество <b>CRF 8</b> — почти lossless\n"
+                "• Генерация занимает <b>~10–20 секунд</b> (дольше обычного)\n\n"
+                "<b>Как использовать:</b>\n"
+                "📩 <b>В личке</b> — напишите:\n"
+                "<code>премиум PlushPepe-22</code>\n"
+                "<code>премиум https://t.me/nft/PlushPepe-22</code>\n\n"
+                "👥 <b>В чате</b> — напишите:\n"
+                "<code>+а превью премиум PlushPepe-22</code>\n\n"
+                "<b>Условия:</b>\n"
+                f"⏱ Не чаще <b>1 раза в 15 минут</b>\n\n"
+                "<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
+                "<i>По вопросам: <a href='https://t.me/balfikovich'>@balfikovich</a></i>",
+                parse_mode=ParseMode.HTML,
+            )
+            notified = True
+        except Exception as e:
+            logger.warning("Не удалось уведомить uid=%d о премиуме: %s", target_uid, e)
+
+        await message.answer(
+            f"✅ Пользователь <code>{target_uid}</code> (<code>@{target}</code>) "
+            f"добавлен в премиум.\n"
+            f"{'✉️ Уведомление отправлено.' if notified else '⚠️ Уведомить не удалось (бот не запущен у пользователя).'}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="❌ Отозвать премиум",
+                                     callback_data=f"{CB_REMOVE_PREMIUM}{target_uid}")
+            ]]),
+        )
+        user_log.info("⭐ ПРЕМИУМ ВЫДАН | uid=%d | admin=%d", target_uid, ADMIN_ID)
+        return
+
     # ── ГРУППА ────────────────────────────────────────────────────────────────
     if not is_private:
         lower = raw.lower()
 
         # Инструкция
         if lower.strip() in ("превью инструкция", "preview инструкция",
+
                              "превью instruction", "preview instruction"):
             wait = check_instr_antispam(message.chat.id)
             if wait > 0:
@@ -2192,6 +2539,30 @@ async def handle_text(message: Message) -> None:
             return
 
         # +а превью — анимированное MP4 с подписью
+        # ВАЖНО: +а превью премиум проверяем ПЕРВЫМ (до обычного +а превью)
+        if (lower.startswith("+а превью премиум") or lower.startswith("+а preview премиум")
+                or lower.startswith("+а превью premium") or lower.startswith("+а preview premium")):
+            for prefix in ("+а превью премиум", "+а preview премиум",
+                           "+а превью premium", "+а preview premium"):
+                if lower.startswith(prefix):
+                    raw = raw[len(prefix):].strip()
+                    break
+            if not is_premium(uid):
+                await message.answer(
+                    f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
+                    "<b>Это команда премиум-пользователей</b>\n"
+                    "<i>(находится в тестовой версии)</i>\n\n"
+                    "Если вы хотите получить тестовые возможности премиума — напишите "
+                    "<a href='https://t.me/balfikovich'>@balfikovich</a>.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            spam = record_spam_event(uid)
+            if await _handle_spam_result(spam, uid, message):
+                return
+            await _handle_premium_video(message, raw)
+            return
+
         if lower.startswith("+а превью") or lower.startswith("+а preview"):
             for prefix in ("+а превью", "+а preview"):
                 if lower.startswith(prefix):
@@ -2218,6 +2589,29 @@ async def handle_text(message: Message) -> None:
         return
 
     # ── ЛИЧКА ─────────────────────────────────────────────────────────────────
+    # Премиум-команда в личке: "премиум <slug>"
+    lower_raw = raw.lower()
+    if lower_raw.startswith("премиум") or lower_raw.startswith("premium"):
+        for prefix in ("премиум", "premium"):
+            if lower_raw.startswith(prefix):
+                raw_slug = raw[len(prefix):].strip()
+                break
+        if not is_premium(uid):
+            await message.answer(
+                f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
+                "<b>Это команда премиум-пользователей</b>\n"
+                "<i>(находится в тестовой версии)</i>\n\n"
+                "Если вы хотите получить тестовые возможности премиума — напишите "
+                "<a href='https://t.me/balfikovich'>@balfikovich</a>.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        spam = record_spam_event(uid)
+        if await _handle_spam_result(spam, uid, message):
+            return
+        await _handle_premium_video(message, raw_slug)
+        return
+
     spam = record_spam_event(uid)
     if await _handle_spam_result(spam, uid, message):
         return
@@ -2227,6 +2621,7 @@ async def handle_text(message: Message) -> None:
 # ── Только GIF без подписи (группа) ──────────────────────────────────────────
 async def _handle_group_gif_only(message: Message, raw: str) -> None:
     slug = extract_nft_slug(raw)
+    reply_to = message.message_id
 
     if not slug:
         await message.answer(
@@ -2240,6 +2635,7 @@ async def _handle_group_gif_only(message: Message, raw: str) -> None:
 
     user_log.info("🎞 GIF-ONLY ЗАПРОС (группа) | slug=%s | %s | %s",
                   slug, _u(message.from_user), _chat(message.chat))
+    _log_request(slug, message.from_user, message.chat)
 
     wait = check_slug_antispam(message.chat.id, slug)
     if wait > 0:
@@ -2263,7 +2659,6 @@ async def _handle_group_gif_only(message: Message, raw: str) -> None:
             parse_mode=ParseMode.HTML,
         )
         return
-
     await safe_delete(wm)
     wm = await message.answer("⚙️ Конвертирую в GIF…")
 
@@ -2292,8 +2687,9 @@ async def _handle_group_gif_only(message: Message, raw: str) -> None:
     # Отправляем как animation (зацикленный GIF/MP4) — без подписи и кнопок
     file = BufferedInputFile(mp4_data, filename=f"{slug}.mp4")
     try:
-        await message.answer_animation(animation=file)
+        await message.answer_animation(animation=file, reply_to_message_id=reply_to)
         user_log.info("✅ GIF-ONLY | slug=%s | %s", slug, _u(message.from_user))
+        asyncio.create_task(_delayed_delete(message, delay=10.0))
     except Exception as e:
         logger.error("_handle_group_gif_only send: %s", e)
         await message.answer(
@@ -2318,6 +2714,7 @@ async def _handle_group_tgs_only(message: Message, raw: str) -> None:
 
     user_log.info("🎭 TGS-ONLY ЗАПРОС (группа) | slug=%s | %s | %s",
                   slug, _u(message.from_user), _chat(message.chat))
+    _log_request(slug, message.from_user, message.chat)
 
     wait = check_slug_antispam(message.chat.id, slug)
     if wait > 0:
@@ -2343,13 +2740,16 @@ async def _handle_group_tgs_only(message: Message, raw: str) -> None:
         return
 
     # Отправляем TGS файл с нормальным именем
-    await send_tgs_sticker(message, tgs_data, slug)
+    ok = await send_tgs_sticker(message, tgs_data, slug)
     user_log.info("✅ TGS-ONLY | slug=%s | %s", slug, _u(message.from_user))
+    if ok:
+        asyncio.create_task(_delayed_delete(message, delay=10.0))
 
 
 # ── Статичная PNG (группа) ────────────────────────────────────────────────────
 async def _handle_group_static(message: Message, raw: str) -> None:
     slug = extract_nft_slug(raw)
+    reply_to = message.message_id  # отвечаем на запрос пользователя
 
     if not slug:
         user_log.info("❓ НЕВЕРНЫЙ ФОРМАТ (группа) | %s | %s",
@@ -2365,6 +2765,7 @@ async def _handle_group_static(message: Message, raw: str) -> None:
 
     user_log.info("🖼 ЗАПРОС (группа) | slug=%s | %s | %s",
                   slug, _u(message.from_user), _chat(message.chat))
+    _log_request(slug, message.from_user, message.chat)
 
     wait = check_slug_antispam(message.chat.id, slug)
     if wait > 0:
@@ -2426,17 +2827,27 @@ async def _handle_group_static(message: Message, raw: str) -> None:
                   slug, attrs.model, _u(message.from_user), elapsed)
 
     png = webp_to_png(webp)
+    sent = False
     if png:
-        ok = await send_static_photo(message, png, slug, attrs, floor_price, ton_rate)
-        if not ok:
+        ok = await send_static_photo(message, png, slug, attrs, floor_price, ton_rate,
+                                     reply_to=reply_to)
+        if ok:
+            sent = True
+        else:
             await send_document(message.answer_document, webp, f"{slug}.webp")
+            sent = True
     else:
         await send_document(message.answer_document, webp, f"{slug}.webp")
+        sent = True
+
+    if sent:
+        asyncio.create_task(_delayed_delete(message, delay=10.0))
 
 
 # ── Анимированная MP4 (группа) ───────────────────────────────────────────────
 async def _handle_group_video(message: Message, raw: str) -> None:
     slug = extract_nft_slug(raw)
+    reply_to = message.message_id
 
     if not slug:
         await message.answer(
@@ -2450,6 +2861,7 @@ async def _handle_group_video(message: Message, raw: str) -> None:
 
     user_log.info("🎬 ЗАПРОС (группа аним) | slug=%s | %s | %s",
                   slug, _u(message.from_user), _chat(message.chat))
+    _log_request(slug, message.from_user, message.chat)
 
     wait = check_slug_antispam(message.chat.id, slug)
     if wait > 0:
@@ -2505,13 +2917,11 @@ async def _handle_group_video(message: Message, raw: str) -> None:
 
     mp4_data: Optional[bytes] = None
     if tgs_ok and tgs_data:
-        # Проверяем кэш
         mp4_data = _video_cache_get(slug)
         if mp4_data:
             logger.info("🎯 VIDEO CACHE HIT | slug=%s", slug)
         else:
             await safe_delete(wm)
-            # Уведомляем если семафор занят
             if _convert_semaphore._value == 0:
                 wm = await message.answer("⏳ Сервер занят, ваш запрос в очереди…")
             else:
@@ -2529,22 +2939,136 @@ async def _handle_group_video(message: Message, raw: str) -> None:
     elapsed = round(time.monotonic() - t0, 2)
 
     if mp4_data:
-        ok = await send_video(message, mp4_data, slug, attrs, floor_price, ton_rate)
+        ok = await send_video(message, mp4_data, slug, attrs, floor_price, ton_rate,
+                              reply_to=reply_to)
         if ok:
             user_log.info("✅ MP4 (группа) | slug=%s | %s | %.2fс",
                           slug, _u(message.from_user), elapsed)
+            asyncio.create_task(_delayed_delete(message, delay=10.0))
             return
 
     if img_ok and webp:
         png = webp_to_png(webp)
         if png:
-            ok = await send_static_photo(message, png, slug, attrs, floor_price, ton_rate)
+            ok = await send_static_photo(message, png, slug, attrs, floor_price, ton_rate,
+                                         reply_to=reply_to)
             if ok:
+                asyncio.create_task(_delayed_delete(message, delay=10.0))
                 return
         await send_document(message.answer_document, webp, f"{slug}.webp")
+        asyncio.create_task(_delayed_delete(message, delay=10.0))
     else:
         await message.answer(
             f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> Не удалось создать видео.',
+            parse_mode=ParseMode.HTML,
+        )
+
+
+# ── Премиум MP4 (личка и группа) ─────────────────────────────────────────────
+async def _handle_premium_video(message: Message, raw: str) -> None:
+    """Генерирует видео в максимальном качестве. Доступно только премиум-пользователям."""
+    uid      = message.from_user.id
+    slug     = extract_nft_slug(raw)
+    is_group = message.chat.type != "private"
+    reply_to = message.message_id if is_group else None
+
+    if not slug:
+        await message.answer(
+            f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> <b>Неверный формат.</b>\n\n'
+            "<b>Примеры:</b>\n"
+            "<code>премиум PlushPepe-22</code>\n"
+            "<code>премиум https://t.me/nft/PlushPepe-22</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Проверяем кулдаун (15 минут)
+    rem = premium_cooldown_remaining(uid)
+    if rem > 0:
+        m, s = int(rem) // 60, int(rem) % 60
+        ts = f"{m} мин {s} сек" if m else f"{int(s)} сек"
+        await message.answer(
+            f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
+            f"<b>Премиум на перезарядке.</b>\n\nПодождите ещё <code>{ts}</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Фиксируем время использования
+    _premium_cooldown[uid] = time.monotonic()
+
+    user_log.info("⭐ ПРЕМИУМ ЗАПРОС | slug=%s | %s", slug, _u(message.from_user))
+    _log_request(f"⭐{slug}", message.from_user, message.chat)
+
+    wm = await message.answer(
+        f'<tg-emoji emoji-id="{E_PREMIUM}">⭐</tg-emoji> '
+        "<b>Генерирую премиум-превью…</b>\n"
+        "<i>1080px · CRF 8 · ~10–20 сек</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+    name_part, _ = split_slug(slug)
+    nice_name = normalize_gift_name(name_part)
+
+    if is_group and not _chat_acquire(message.chat.id):
+        await safe_delete(wm)
+        await message.answer(
+            f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
+            "<b>Чат занят.</b> Попробуй чуть позже.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    t0 = time.monotonic()
+    try:
+        (img_ok, webp, img_err), (tgs_ok, tgs_data, tgs_err), attrs, (floor_price, ton_rate) = await asyncio.gather(
+            fetch_nft_image(slug),
+            fetch_nft_tgs(slug),
+            fetch_nft_attrs(slug),
+            fetch_floor_price(nice_name),
+        )
+    finally:
+        if is_group:
+            _chat_release(message.chat.id)
+
+    if not tgs_ok or not tgs_data:
+        await safe_delete(wm)
+        err = tgs_err or img_err
+        await message.answer(
+            f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> '
+            f"<b>Не удалось загрузить анимацию</b>\n"
+            f"<code>{slug}</code>\n<i>{err or 'не найден'}</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Конвертируем в максимальном качестве
+    try:
+        async with _convert_semaphore:
+            mp4_data = await asyncio.wait_for(
+                asyncio.to_thread(tgs_to_mp4_premium, tgs_data), timeout=300.0)
+    except asyncio.TimeoutError:
+        mp4_data = None
+
+    await safe_delete(wm)
+    elapsed = round(time.monotonic() - t0, 2)
+
+    if not mp4_data:
+        await message.answer(
+            f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> Не удалось конвертировать видео.',
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    ok = await send_video(message, mp4_data, slug, attrs, floor_price, ton_rate,
+                          reply_to=reply_to)
+    if ok:
+        user_log.info("✅ ПРЕМИУМ MP4 | slug=%s | %s | %.2fс", slug, _u(message.from_user), elapsed)
+        if is_group:
+            asyncio.create_task(_delayed_delete(message, delay=10.0))
+    else:
+        await message.answer(
+            f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> Не удалось отправить видео.',
             parse_mode=ParseMode.HTML,
         )
 
@@ -2616,7 +3140,7 @@ async def _handle_private_video(message: Message, raw: str) -> None:
         )
         return
 
-    user_log.info("🎬 ЗАПРОС (личка) | slug=%s | %s", slug, _u(message.from_user))
+    user_log.info("🎬 ЗАПРОС (личка) | slug=%s | %s", slug, _u(message.from_user)); _log_request(slug, message.from_user, message.chat)
 
     t0 = time.monotonic()
     wm = await message.answer("🔍 Загружаю данные…")
@@ -2731,7 +3255,7 @@ async def _handle_private_video(message: Message, raw: str) -> None:
         )
         return
 
-    user_log.info("🎬 ЗАПРОС (личка) | slug=%s | %s", slug, _u(message.from_user))
+    user_log.info("🎬 ЗАПРОС (личка) | slug=%s | %s", slug, _u(message.from_user)); _log_request(slug, message.from_user, message.chat)
 
     t0 = time.monotonic()
     wm = await message.answer("🔍 Загружаю данные…")
@@ -2920,6 +3444,9 @@ async def on_startup() -> None:
     get_session()
     me = await bot.get_me()
     BOT_USERNAME = me.username or ""
+
+    # Загружаем премиум-пользователей
+    _load_premium()
 
     # Запускаем фоновую очистку
     asyncio.create_task(_background_cleanup())
