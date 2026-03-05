@@ -199,6 +199,14 @@ _awaiting_donate:        set[int]               = set()
 _last_instr:             dict[int, float]       = {}
 _last_button:            dict[str, float]       = {}
 
+# ── Защита от спама одинаковыми slug (дедупликация) ──────────────────────────
+# uid -> set of slugs currently being processed
+_processing_slugs:       dict[int, set[str]]    = {}
+# uid -> timestamp of last COMPLETED request (для кулдауна между разными slug)
+_last_completed:         dict[int, float]       = {}
+# Кулдаун между РАЗНЫМИ slug в личке (секунды)
+PRIVATE_SLUG_COOLDOWN = 60.0
+
 
 def _get_cb_lock(uid: int) -> asyncio.Lock:
     """Возвращает asyncio.Lock для конкретного пользователя (создаёт если нет)."""
@@ -372,6 +380,14 @@ async def _background_cleanup() -> None:
             for uid in list(_last_request):
                 if now - _last_request[uid] > 600:
                     del _last_request[uid]
+            # _last_completed — старше 10 минут
+            for uid in list(_last_completed):
+                if now - _last_completed[uid] > 600:
+                    del _last_completed[uid]
+            # _processing_slugs — зависшие (старше 5 минут не должно быть)
+            for uid in list(_processing_slugs):
+                if not _processing_slugs[uid]:
+                    del _processing_slugs[uid]
             # _last_slug — старше 15 минут
             for k in list(_last_slug):
                 if now - _last_slug[k] > 900:
@@ -482,6 +498,42 @@ def get_spam_mute_remaining(uid: int) -> Optional[int]:
         return None
     remaining = int(muted_until - time.monotonic())
     return remaining if remaining > 0 else None
+
+
+def _dedup_acquire(uid: int, slug: str) -> bool:
+    """
+    Возвращает True если этот slug ещё не обрабатывается у данного пользователя.
+    При True — регистрирует slug как «в обработке».
+    """
+    slugs = _processing_slugs.setdefault(uid, set())
+    slug_lower = slug.lower()
+    if slug_lower in slugs:
+        return False
+    slugs.add(slug_lower)
+    return True
+
+
+def _dedup_release(uid: int, slug: str) -> None:
+    """Убирает slug из «в обработке» и фиксирует время завершения."""
+    slugs = _processing_slugs.get(uid)
+    if slugs:
+        slugs.discard(slug.lower())
+        if not slugs:
+            del _processing_slugs[uid]
+    _last_completed[uid] = time.monotonic()
+
+
+def check_private_slug_cooldown(uid: int) -> float:
+    """
+    Проверяет кулдаун между РАЗНЫМИ slug в личке.
+    Возвращает 0 если можно, иначе сколько секунд ждать.
+    Не записывает — только проверяет.
+    """
+    last = _last_completed.get(uid, 0.0)
+    diff = time.monotonic() - last
+    if diff < PRIVATE_SLUG_COOLDOWN:
+        return round(PRIVATE_SLUG_COOLDOWN - diff, 0)
+    return 0.0
 
 
 def check_antispam(user_id: int) -> float:
@@ -2501,6 +2553,154 @@ async def _handle_group_video(message: Message, raw: str) -> None:
 async def _handle_private_video(message: Message, raw: str) -> None:
     uid  = message.from_user.id
     slug = extract_nft_slug(raw)
+
+    if not slug:
+        await message.answer(
+            f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> <b>Неверный формат.</b>\n\n'
+            "<b>Примеры:</b>\n"
+            "<code>Plush Pepe 22</code>\n"
+            "<code>t.me/nft/PlushPepe-22</code>\n"
+            "<code>https://t.me/nft/PlushPepe-22</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # ── Дедупликация: один и тот же slug уже обрабатывается? ─────────────────
+    if not _dedup_acquire(uid, slug):
+        await message.answer(
+            f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
+            f"<b>Этот подарок уже обрабатывается!</b>\n\n"
+            f"<code>{slug}</code>\n\n"
+            "Дождись ответа — дублировать запрос не нужно.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # ── Кулдаун между РАЗНЫМИ slug: не чаще 1 раза в минуту ─────────────────
+    # Проверяем только если у пользователя нет других slug в обработке
+    # (т.е. этот slug — первый и единственный)
+    currently_processing = _processing_slugs.get(uid, set())
+    if len(currently_processing) == 1:  # только что добавленный (текущий)
+        wait = check_private_slug_cooldown(uid)
+        # Не применяем кулдаун если пользователь ждёт впервые (last_completed = 0)
+        if wait > 0 and uid in _last_completed:
+            _dedup_release(uid, slug)
+            mins = int(wait) // 60
+            secs = int(wait) % 60
+            ts = f"{mins} мин {secs} сек" if mins else f"{int(secs)} сек"
+            await message.answer(
+                f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
+                f"<b>Слишком быстро!</b>\n\n"
+                f"Подождите <code>{ts}</code> перед новым запросом.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+    wait_as = check_antispam(uid)
+    if wait_as > 0:
+        _dedup_release(uid, slug)
+        await message.answer(
+            f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
+            f"<b>Слишком быстро!</b> Подожди <code>{wait_as}</code> сек.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Лимит параллельных генераций в личке (через тот же chat_id = uid)
+    if not _chat_acquire(uid):
+        _dedup_release(uid, slug)
+        await message.answer(
+            f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
+            "<b>Уже идёт генерация.</b> Дождись результата предыдущего запроса.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    user_log.info("🎬 ЗАПРОС (личка) | slug=%s | %s", slug, _u(message.from_user))
+
+    t0 = time.monotonic()
+    wm = await message.answer("🔍 Загружаю данные…")
+
+    name_part, _ = split_slug(slug)
+    nice_name = normalize_gift_name(name_part)
+
+    try:
+        (img_ok, webp, img_err), (tgs_ok, tgs_data, tgs_err), attrs, (floor_price, ton_rate) = await asyncio.gather(
+            fetch_nft_image(slug),
+            fetch_nft_tgs(slug),
+            fetch_nft_attrs(slug),
+            fetch_floor_price(nice_name),
+        )
+    finally:
+        _chat_release(uid)
+
+    if not img_ok and not tgs_ok:
+        await safe_delete(wm)
+        _dedup_release(uid, slug)
+        err = tgs_err or img_err
+        if err:
+            await message.answer(
+                f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
+                f"<b>Ошибка загрузки</b>\n<code>{slug}</code>\n<i>{err}</i>",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await message.answer(
+                f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> '
+                f"<b>Подарок не найден</b>\n\n<code>{slug}</code>\n\n"
+                "<b>Возможные причины:</b>\n"
+                "• Такого номера не существует\n"
+                "• Подарок сожжён 🔥\n"
+                "• Опечатка в названии",
+                parse_mode=ParseMode.HTML,
+            )
+        return
+
+    mp4_data: Optional[bytes] = None
+    if tgs_ok and tgs_data:
+        mp4_data = _video_cache_get(slug)
+        if mp4_data:
+            logger.info("🎯 VIDEO CACHE HIT | slug=%s", slug)
+        else:
+            await safe_delete(wm)
+            # Уведомляем если семафор занят
+            if _convert_semaphore._value == 0:
+                wm = await message.answer("⏳ Сервер занят, ваш запрос в очереди…")
+            else:
+                wm = await message.answer("⚙️ Конвертирую в видео…")
+            try:
+                async with _convert_semaphore:
+                    mp4_data = await asyncio.wait_for(
+                        asyncio.to_thread(tgs_to_mp4, tgs_data), timeout=180.0)
+                if mp4_data:
+                    _video_cache_put(slug, mp4_data)
+            except asyncio.TimeoutError:
+                mp4_data = None
+
+    await safe_delete(wm)
+    elapsed = round(time.monotonic() - t0, 2)
+    _dedup_release(uid, slug)
+
+    if mp4_data:
+        ok = await send_video(message, mp4_data, slug, attrs, floor_price, ton_rate)
+        if ok:
+            user_log.info("✅ MP4 ОТПРАВЛЕНО | slug=%s | %s | %.2fс",
+                          slug, _u(message.from_user), elapsed)
+            return
+
+    if img_ok and webp:
+        png = webp_to_png(webp)
+        if png:
+            ok = await send_static_photo(message, png, slug, attrs, floor_price, ton_rate)
+            if ok:
+                return
+        await send_document(message.answer_document, webp, f"{slug}.webp")
+    else:
+        await message.answer(
+            f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> '
+            "Не удалось создать видео и загрузить картинку.",
+            parse_mode=ParseMode.HTML,
+        )
 
     if not slug:
         await message.answer(
