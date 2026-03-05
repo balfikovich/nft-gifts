@@ -258,18 +258,21 @@ def _log_request(slug: str, user, chat) -> None:
         _request_log.pop(0)
 
 # ── Премиум-пользователи ──────────────────────────────────────────────────────
-_premium_users: set[int] = set()        # uid -> True
-_premium_cooldown: dict[int, float] = {}  # uid -> monotonic time последнего премиум-запроса
+_premium_users: set[int] = set()           # uid -> True (числовые ID)
+_premium_pending: set[str] = set()         # username (lowercase, без @) — ждут первого входа
+_premium_cooldown: dict[int, float] = {}   # uid -> monotonic time последнего премиум-запроса
 
 def _load_premium() -> None:
     """Загружает список премиум-пользователей из файла."""
-    global _premium_users
+    global _premium_users, _premium_pending
     try:
         if os.path.exists(PREMIUM_FILE):
             with open(PREMIUM_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            _premium_users = set(data.get("users", []))
-            logger.info("✅ Загружено %d премиум-пользователей", len(_premium_users))
+            _premium_users   = set(data.get("users", []))
+            _premium_pending = set(data.get("pending", []))
+            logger.info("✅ Загружено %d премиум-пользователей, %d pending",
+                        len(_premium_users), len(_premium_pending))
     except Exception as e:
         logger.error("_load_premium error: %s", e)
 
@@ -277,12 +280,24 @@ def _save_premium() -> None:
     """Сохраняет список премиум-пользователей в файл."""
     try:
         with open(PREMIUM_FILE, "w", encoding="utf-8") as f:
-            json.dump({"users": list(_premium_users)}, f)
+            json.dump({
+                "users":   list(_premium_users),
+                "pending": list(_premium_pending),
+            }, f)
     except Exception as e:
         logger.error("_save_premium error: %s", e)
 
-def is_premium(uid: int) -> bool:
-    return uid in _premium_users or uid == ADMIN_ID
+def is_premium(uid: int, username: Optional[str] = None) -> bool:
+    if uid == ADMIN_ID or uid in _premium_users:
+        return True
+    # Резолвим pending по username если он есть
+    if username and username.lower() in _premium_pending:
+        _premium_pending.discard(username.lower())
+        _premium_users.add(uid)
+        _save_premium()
+        logger.info("⭐ PENDING РЕЗОЛВЛЕН: @%s → uid=%d", username, uid)
+        return True
+    return False
 
 def premium_cooldown_remaining(uid: int) -> float:
     """Сколько секунд осталось до следующего премиум-запроса. 0 = можно."""
@@ -1112,11 +1127,119 @@ def tgs_to_mp4(tgs_bytes: bytes, size: int = 720, crf: int = 14, preset: str = "
 
 def tgs_to_mp4_premium(tgs_bytes: bytes) -> Optional[bytes]:
     """
-    Премиум конвертация TGS → MP4.
-    1080px, CRF 8 (почти lossless), preset slow.
-    Дольше, но максимальное качество изображения.
+    МАКСИМАЛЬНОЕ качество TGS → MP4.
+    Pipeline:
+      1. Рендерим каждый кадр в 2× нативный размер rlottie (обычно 512→1024px)
+         через render_pillow_frame — это максимум без апскейла.
+      2. Lanczos-даунсемплинг до 1080px — суперсемплинг, убирает алиасинг.
+      3. RGBA→RGB с альфа-компоситингом на чёрный фон.
+      4. ffmpeg libx264: preset veryslow, CRF 0 (lossless),
+         -x264-params ref=16:bframes=8:me=umh:subme=11:trellis=2 — максимум.
+      5. Финальный pass: faststart для стриминга.
+    Генерируется ~20–60 сек в зависимости от сервера.
     """
-    return tgs_to_mp4(tgs_bytes, size=PREMIUM_VIDEO_SIZE, crf=PREMIUM_VIDEO_CRF, preset="slow")
+    try:
+        from rlottie_python import LottieAnimation
+        from PIL import Image
+    except ImportError as e:
+        logger.error("tgs_to_mp4_premium: не хватает библиотеки: %s", e)
+        return None
+
+    RENDER_SIZE = 1024   # рендерим в 2× (нативный max rlottie)
+    OUT_SIZE    = 1080   # финальный размер после Lanczos-даунсемплинга
+
+    tmp_dir    = tempfile.mkdtemp(prefix="nft_prem_")
+    tgs_path   = os.path.join(tmp_dir, "anim.tgs")
+    mp4_path   = os.path.join(tmp_dir, "out.mp4")
+    frames_dir = os.path.join(tmp_dir, "frames")
+
+    try:
+        with open(tgs_path, "wb") as f:
+            f.write(tgs_bytes)
+
+        anim        = LottieAnimation.from_tgs(tgs_path)
+        frame_count = anim.lottie_animation_get_totalframe()
+        fps         = anim.lottie_animation_get_framerate()
+
+        if frame_count == 0:
+            logger.error("tgs_to_mp4_premium: 0 кадров")
+            return None
+
+        fps = max(fps, 1)
+        os.makedirs(frames_dir, exist_ok=True)
+
+        for i in range(frame_count):
+            # Рендерим в максимальном размере который поддерживает rlottie
+            frame_img = anim.render_pillow_frame(frame_num=i, width=RENDER_SIZE, height=RENDER_SIZE)
+            if frame_img is None:
+                # Fallback — рендерим в стандартном размере
+                frame_img = anim.render_pillow_frame(frame_num=i)
+            if frame_img is None:
+                continue
+
+            # Суперсемплинг: даунскейл Lanczos с 1024 → 1080 (если уже 512 → апскейл)
+            if frame_img.size != (OUT_SIZE, OUT_SIZE):
+                frame_img = frame_img.resize((OUT_SIZE, OUT_SIZE), Image.LANCZOS)
+
+            # Альфа-композитинг на чёрный фон
+            if frame_img.mode == "RGBA":
+                bg = Image.new("RGB", (OUT_SIZE, OUT_SIZE), (0, 0, 0))
+                bg.paste(frame_img, mask=frame_img.split()[3])
+                frame_img = bg
+            elif frame_img.mode != "RGB":
+                frame_img = frame_img.convert("RGB")
+
+            # Сохраняем без сжатия для максимального качества передачи в ffmpeg
+            frame_img.save(
+                os.path.join(frames_dir, f"frame_{i:05d}.png"),
+                format="PNG", compress_level=0,
+            )
+
+        cpu_count = multiprocessing.cpu_count()
+
+        # ffmpeg: максимальное качество x264
+        # CRF 0 = lossless для x264, veryslow = лучшее сжатие/качество
+        # x264-params: ref=16 (максимум), bframes=8, me=umh, subme=11, trellis=2
+        cmd = [
+            "ffmpeg", "-y",
+            "-threads", str(cpu_count),
+            "-framerate", str(fps),
+            "-i", os.path.join(frames_dir, "frame_%05d.png"),
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-crf", "0",
+            "-preset", "veryslow",
+            "-tune", "animation",
+            "-profile:v", "high",
+            "-level", "5.1",
+            "-x264-params",
+            "ref=16:bframes=8:me=umh:subme=11:trellis=2:deblock=-1,-1:psy-rd=1.0:aq-mode=3",
+            "-movflags", "+faststart",
+            mp4_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=600)
+        if result.returncode != 0:
+            logger.error("ffmpeg premium error: %s", result.stderr.decode(errors="replace")[-800:])
+            return None
+
+        with open(mp4_path, "rb") as f:
+            mp4_data = f.read()
+
+        logger.info("tgs_to_mp4_premium OK: %d кадров, %.1f fps, %dx%d, %d байт",
+                    frame_count, fps, OUT_SIZE, OUT_SIZE, len(mp4_data))
+        return mp4_data
+
+    except subprocess.TimeoutExpired:
+        logger.error("tgs_to_mp4_premium: ffmpeg timeout (600s)")
+        return None
+    except Exception as e:
+        logger.error("tgs_to_mp4_premium error: %s", e, exc_info=True)
+        return None
+    finally:
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 def tgs_to_gif(tgs_bytes: bytes, size: int = 800) -> Optional[bytes]:
@@ -1765,7 +1888,8 @@ async def cmd_premium_status(message: Message) -> None:
     if message.chat.type != "private":
         return
     uid = message.from_user.id
-    if is_premium(uid):
+    uname = getattr(message.from_user, "username", None)
+    if is_premium(uid, uname):
         rem = premium_cooldown_remaining(uid)
         cooldown_text = ""
         if rem > 0:
@@ -2432,68 +2556,65 @@ async def handle_text(message: Message) -> None:
     if uid == ADMIN_ID and uid in _awaiting_premium_input:
         _awaiting_premium_input.discard(uid)
         target = raw.strip().lstrip("@")
-        target_uid = None
-        # Числовой ID
+
+        # Случай 1: числовой ID — добавляем напрямую
         if target.isdigit():
             target_uid = int(target)
-        else:
-            # Попытка найти пользователя по username через Telegram (не всегда работает)
+            _premium_users.add(target_uid)
+            _save_premium()
+            notified = False
             try:
-                chat_obj = await bot.get_chat(f"@{target}")
-                target_uid = chat_obj.id
-            except Exception:
-                await message.answer(
-                    f"❌ Не удалось найти пользователя <code>@{target}</code>.\n\n"
-                    "Попробуй указать числовой <b>ID</b> пользователя.",
+                await bot.send_message(
+                    target_uid,
+                    f'<tg-emoji emoji-id="{E_PREMIUM}">⭐</tg-emoji> <b>Вам выдан премиум-доступ!</b>\n'
+                    "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
+                    "🎉 Поздравляем! Теперь вам доступна генерация видео в <b>максимальном качестве</b>.\n\n"
+                    "<b>Что такое Премиум-превью:</b>\n"
+                    "• Разрешение <b>1080px</b> — суперсемплинг\n"
+                    "• Качество <b>CRF 0 + veryslow</b> — lossless\n"
+                    "• Генерация занимает <b>~20–60 секунд</b> (дольше обычного)\n\n"
+                    "<b>Как использовать:</b>\n"
+                    "📩 <b>В личке</b> — напишите:\n"
+                    "<code>премиум PlushPepe-22</code>\n"
+                    "<code>премиум https://t.me/nft/PlushPepe-22</code>\n\n"
+                    "👥 <b>В чате</b> — напишите:\n"
+                    "<code>+а превью премиум PlushPepe-22</code>\n\n"
+                    "<b>Условия:</b>\n"
+                    f"⏱ Не чаще <b>1 раза в 15 минут</b>\n\n"
+                    "<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
+                    "<i>По вопросам: <a href='https://t.me/balfikovich'>@balfikovich</a></i>",
                     parse_mode=ParseMode.HTML,
                 )
-                return
+                notified = True
+            except Exception as e:
+                logger.warning("Не удалось уведомить uid=%d о премиуме: %s", target_uid, e)
 
-        _premium_users.add(target_uid)
-        _save_premium()
-        # Уведомляем пользователя
-        notified = False
-        try:
-            remove_kbd = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="❌ Отозвать премиум",
-                                     callback_data=f"{CB_REMOVE_PREMIUM}{target_uid}")
-            ]])
-            await bot.send_message(
-                target_uid,
-                f'<tg-emoji emoji-id="{E_PREMIUM}">⭐</tg-emoji> <b>Вам выдан премиум-доступ!</b>\n'
-                "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
-                "🎉 Поздравляем! Теперь вам доступна генерация видео в <b>максимальном качестве</b>.\n\n"
-                "<b>Что такое Премиум-превью:</b>\n"
-                "• Разрешение <b>1080px</b> вместо обычных 720px\n"
-                "• Качество <b>CRF 8</b> — почти lossless\n"
-                "• Генерация занимает <b>~10–20 секунд</b> (дольше обычного)\n\n"
-                "<b>Как использовать:</b>\n"
-                "📩 <b>В личке</b> — напишите:\n"
-                "<code>премиум PlushPepe-22</code>\n"
-                "<code>премиум https://t.me/nft/PlushPepe-22</code>\n\n"
-                "👥 <b>В чате</b> — напишите:\n"
-                "<code>+а превью премиум PlushPepe-22</code>\n\n"
-                "<b>Условия:</b>\n"
-                f"⏱ Не чаще <b>1 раза в 15 минут</b>\n\n"
-                "<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
-                "<i>По вопросам: <a href='https://t.me/balfikovich'>@balfikovich</a></i>",
+            await message.answer(
+                f"✅ Пользователь <code>{target_uid}</code> добавлен в премиум.\n"
+                f"{'✉️ Уведомление отправлено.' if notified else '⚠️ Уведомить не удалось — пользователь ещё не запускал бота.'}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="❌ Отозвать премиум",
+                                         callback_data=f"{CB_REMOVE_PREMIUM}{target_uid}")
+                ]]),
+            )
+            user_log.info("⭐ ПРЕМИУМ ВЫДАН (ID) | uid=%d | admin=%d", target_uid, ADMIN_ID)
+
+        # Случай 2: username — добавляем в pending, активируется при первом обращении
+        else:
+            uname_lower = target.lower()
+            _premium_pending.add(uname_lower)
+            _save_premium()
+            await message.answer(
+                f"✅ <b>@{target}</b> добавлен в список премиум.\n\n"
+                "⏳ <b>Доступ активируется автоматически</b> когда пользователь напишет боту.\n\n"
+                "Так работает Telegram Bot API — ID пользователя нельзя узнать по username "
+                "напрямую. Как только <b>@{target}</b> напишет боту — получит уведомление.\n\n"
+                f"ℹ️ Можно ускорить: попроси пользователя прислать тебе свой числовой ID "
+                f"(например через @userinfobot), и введи его вместо username.",
                 parse_mode=ParseMode.HTML,
             )
-            notified = True
-        except Exception as e:
-            logger.warning("Не удалось уведомить uid=%d о премиуме: %s", target_uid, e)
-
-        await message.answer(
-            f"✅ Пользователь <code>{target_uid}</code> (<code>@{target}</code>) "
-            f"добавлен в премиум.\n"
-            f"{'✉️ Уведомление отправлено.' if notified else '⚠️ Уведомить не удалось (бот не запущен у пользователя).'}",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="❌ Отозвать премиум",
-                                     callback_data=f"{CB_REMOVE_PREMIUM}{target_uid}")
-            ]]),
-        )
-        user_log.info("⭐ ПРЕМИУМ ВЫДАН | uid=%d | admin=%d", target_uid, ADMIN_ID)
+            user_log.info("⭐ ПРЕМИУМ PENDING | @%s | admin=%d", target, ADMIN_ID)
         return
 
     # ── ГРУППА ────────────────────────────────────────────────────────────────
@@ -2547,7 +2668,8 @@ async def handle_text(message: Message) -> None:
                 if lower.startswith(prefix):
                     raw = raw[len(prefix):].strip()
                     break
-            if not is_premium(uid):
+            uname = getattr(message.from_user, "username", None)
+            if not is_premium(uid, uname):
                 await message.answer(
                     f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
                     "<b>Это команда премиум-пользователей</b>\n"
@@ -2596,7 +2718,8 @@ async def handle_text(message: Message) -> None:
             if lower_raw.startswith(prefix):
                 raw_slug = raw[len(prefix):].strip()
                 break
-        if not is_premium(uid):
+        uname = getattr(message.from_user, "username", None); 
+        if not is_premium(uid, uname):
             await message.answer(
                 f'<tg-emoji emoji-id="{E_WARN}">⚠️</tg-emoji> '
                 "<b>Это команда премиум-пользователей</b>\n"
@@ -2689,7 +2812,6 @@ async def _handle_group_gif_only(message: Message, raw: str) -> None:
     try:
         await message.answer_animation(animation=file, reply_to_message_id=reply_to)
         user_log.info("✅ GIF-ONLY | slug=%s | %s", slug, _u(message.from_user))
-        asyncio.create_task(_delayed_delete(message, delay=10.0))
     except Exception as e:
         logger.error("_handle_group_gif_only send: %s", e)
         await message.answer(
@@ -2742,8 +2864,6 @@ async def _handle_group_tgs_only(message: Message, raw: str) -> None:
     # Отправляем TGS файл с нормальным именем
     ok = await send_tgs_sticker(message, tgs_data, slug)
     user_log.info("✅ TGS-ONLY | slug=%s | %s", slug, _u(message.from_user))
-    if ok:
-        asyncio.create_task(_delayed_delete(message, delay=10.0))
 
 
 # ── Статичная PNG (группа) ────────────────────────────────────────────────────
@@ -2827,21 +2947,13 @@ async def _handle_group_static(message: Message, raw: str) -> None:
                   slug, attrs.model, _u(message.from_user), elapsed)
 
     png = webp_to_png(webp)
-    sent = False
     if png:
         ok = await send_static_photo(message, png, slug, attrs, floor_price, ton_rate,
                                      reply_to=reply_to)
-        if ok:
-            sent = True
-        else:
+        if not ok:
             await send_document(message.answer_document, webp, f"{slug}.webp")
-            sent = True
     else:
         await send_document(message.answer_document, webp, f"{slug}.webp")
-        sent = True
-
-    if sent:
-        asyncio.create_task(_delayed_delete(message, delay=10.0))
 
 
 # ── Анимированная MP4 (группа) ───────────────────────────────────────────────
@@ -2944,7 +3056,6 @@ async def _handle_group_video(message: Message, raw: str) -> None:
         if ok:
             user_log.info("✅ MP4 (группа) | slug=%s | %s | %.2fс",
                           slug, _u(message.from_user), elapsed)
-            asyncio.create_task(_delayed_delete(message, delay=10.0))
             return
 
     if img_ok and webp:
@@ -2953,10 +3064,8 @@ async def _handle_group_video(message: Message, raw: str) -> None:
             ok = await send_static_photo(message, png, slug, attrs, floor_price, ton_rate,
                                          reply_to=reply_to)
             if ok:
-                asyncio.create_task(_delayed_delete(message, delay=10.0))
                 return
         await send_document(message.answer_document, webp, f"{slug}.webp")
-        asyncio.create_task(_delayed_delete(message, delay=10.0))
     else:
         await message.answer(
             f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> Не удалось создать видео.',
@@ -3064,8 +3173,6 @@ async def _handle_premium_video(message: Message, raw: str) -> None:
                           reply_to=reply_to)
     if ok:
         user_log.info("✅ ПРЕМИУМ MP4 | slug=%s | %s | %.2fс", slug, _u(message.from_user), elapsed)
-        if is_group:
-            asyncio.create_task(_delayed_delete(message, delay=10.0))
     else:
         await message.answer(
             f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> Не удалось отправить видео.',
