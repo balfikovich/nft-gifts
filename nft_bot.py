@@ -1,5 +1,5 @@
 """
-NFT Gift Viewer Bot
+NFT Preview Bot
 ===================
 Зависимости:
     pip install aiogram aiohttp python-dotenv pillow beautifulsoup4 lxml
@@ -122,10 +122,18 @@ E_SYMBOL    = "5409189019261103031"
 E_LINK      = "5409143419593321597"
 E_WARN      = "5409124594751660992"
 E_ERR       = "5408930028438188841"
-E_START     = "6028495398941759268"
+E_START     = "5409129417999936997"   # заменён на запрошенный
 E_DONATE    = "5309759985192832914"
 E_FLOOR_GEM = "5409321884074419506"   # 💎 для Floorprice
 E_FLOOR_TON = "5316802593391916971"   # ❤️ для цены TON
+
+# Новые эмодзи для форматов
+E_FORMAT    = "5215529472165450573"   # для форматов запросов
+E_GROUP     = "5411199012416023580"   # "В группе:"
+E_RULES     = "5409181322679706928"   # "Правила пользования:"
+E_RULE_TIME = "5411376712392928421"   # правила времени
+E_RULE_SPAM = "5409057511657464550"   # не спамить
+E_RULE_GEN  = "5409044257388390754"   # время генерации
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  СЛОВАРЬ ПРАВИЛЬНЫХ НАЗВАНИЙ ПОДАРКОВ
@@ -650,7 +658,7 @@ _RE_LINK = re.compile(
 )
 _RE_SLUG  = re.compile(r"^([A-Za-z][A-Za-z0-9]*)[-](\d+)$", re.IGNORECASE)
 _RE_WORDS = re.compile(
-    r"^([A-Za-z][A-Za-z0-9]*(?:\s+[A-Za-z][A-Za-z0-9]*)*)\s+(\d+)$",
+    r"^([A-Za-z][A-Za-z0-9]*(?:\s+[A-Za-z][A-Za-z0-9]*)*)\s+[№#]?(\d+)$",
     re.IGNORECASE,
 )
 
@@ -935,8 +943,6 @@ def webp_to_png(webp_bytes: bytes) -> Optional[bytes]:
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  TGS → MP4
-#  Нативное качество: читаем w/h из Lottie JSON, рендерим без апскейла,
-#  CRF 1, preset slow — максимальное качество для всех пользователей.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _check_ffmpeg() -> bool:
@@ -961,11 +967,6 @@ def _get_lottie_native_size(tgs_path: str) -> tuple[int, int]:
 
 
 def tgs_to_mp4(tgs_bytes: bytes) -> Optional[bytes]:
-    """
-    Конвертирует TGS → MP4 в нативном разрешении (читает w/h из Lottie JSON).
-    Никакого апскейла — вектор рендерится в родном размере без артефактов.
-    ffmpeg CRF 1, preset slow — минимальные потери при кодировании.
-    """
     try:
         from rlottie_python import LottieAnimation
         from PIL import Image
@@ -982,12 +983,10 @@ def tgs_to_mp4(tgs_bytes: bytes) -> Optional[bytes]:
         with open(tgs_path, "wb") as f:
             f.write(tgs_bytes)
 
-        # Читаем нативный размер из JSON внутри TGS
         native_w, native_h = _get_lottie_native_size(tgs_path)
         native_size = max(native_w, native_h)
         logger.info("tgs_to_mp4: нативный размер TGS = %dx%d", native_w, native_h)
 
-        # Пробуем создать анимацию с нативным размером
         anim = None
         actual_size = native_size
         for try_size in [native_size, 512, 0]:
@@ -1030,7 +1029,6 @@ def tgs_to_mp4(tgs_bytes: bytes) -> Optional[bytes]:
             if frame_img is None:
                 continue
 
-            # Приводим к квадрату если нужно (без апскейла)
             w, h = frame_img.size
             if w != h:
                 side = max(w, h)
@@ -1039,7 +1037,6 @@ def tgs_to_mp4(tgs_bytes: bytes) -> Optional[bytes]:
                 sq.paste(frame_img, ((side - w) // 2, (side - h) // 2))
                 frame_img = sq
 
-            # RGBA → RGB
             if frame_img.mode == "RGBA":
                 size = frame_img.size[0]
                 bg = Image.new("RGB", (size, size), (0, 0, 0))
@@ -1061,7 +1058,6 @@ def tgs_to_mp4(tgs_bytes: bytes) -> Optional[bytes]:
         logger.info("tgs_to_mp4: сохранено %d/%d кадров, размер=%dpx",
                     saved, frame_count, actual_size)
 
-        # ffmpeg: три попытки от лучшего к надёжному
         cmds = [
             ["ffmpeg", "-y", "-framerate", str(fps),
              "-i", os.path.join(frames_dir, "frame_%05d.png"),
@@ -1112,9 +1108,6 @@ def tgs_to_mp4(tgs_bytes: bytes) -> Optional[bytes]:
 
 
 def tgs_to_gif(tgs_bytes: bytes, size: int = 800) -> Optional[bytes]:
-    """
-    Конвертирует TGS → GIF через ffmpeg с оптимальной палитрой.
-    """
     try:
         from rlottie_python import LottieAnimation
         from PIL import Image
@@ -1413,11 +1406,13 @@ def make_keyboard_video(slug: str, expire_ts: int = 0) -> InlineKeyboardMarkup:
 
 def get_group_instruction() -> str:
     return (
-        "📖 <b>Инструкция NFT Gift Viewer</b>\n"
+        "📖 <b>Инструкция NFT Preview Bot</b>\n"
         "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
         "<b>Форматы запросов:</b>\n\n"
         "🖼 <b>Статичная картинка (с подписью):</b>\n"
         "<code>превью Plush Pepe 22</code>\n"
+        "<code>превью Plush Pepe #22</code>\n"
+        "<code>превью Plush Pepe №22</code>\n"
         "<code>превью t.me/nft/PlushPepe-22</code>\n\n"
         "🎬 <b>Анимация MP4 (с подписью):</b>\n"
         "<code>+а превью Plush Pepe 22</code>\n"
@@ -1434,14 +1429,14 @@ def get_group_instruction() -> str:
         "• Кнопки под превью — только 1 раз каждая\n"
         "• <code>превью инструкция</code> — не чаще 1 раза в 5 минут\n\n"
         "<b>❓ Нужна помощь?</b>\n"
-        "Пиши автору: <a href='https://t.me/balfikovich'>@balfikovich</a>"
+        "Пиши автору: @balfikovich"
     )
 
 
 def get_group_welcome(chat_title: str) -> str:
     return (
         f"👋 <b>Привет, {chat_title}!</b>\n\n"
-        "Я <b>NFT Gift Viewer</b> — показываю карточку любого Telegram NFT-подарка.\n\n"
+        "Я <b>NFT Preview Bot</b> — показываю карточку любого Telegram NFT-подарка.\n\n"
         "<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
         "<b>📌 Как пользоваться:</b>\n\n"
         "🖼 <b>Статичная:</b> <code>превью Plush Pepe 22</code>\n"
@@ -1452,39 +1447,42 @@ def get_group_welcome(chat_title: str) -> str:
         "<b>📋 Правила:</b>\n"
         "• Один подарок — не чаще <b>1 раза в 5 минут</b>\n"
         "• Кнопки под превью — только 1 раз каждая\n\n"
-        "⚡ Картинка ~1–2 сек | Видео/GIF ~5–15 сек\n\n"
-        "<i>Автор: <a href='https://t.me/balfikovich'>@balfikovich</a></i>"
+        "⚡ Картинка ~5–10 сек | Видео/GIF ~10–25 сек\n\n"
+        "<i>Автор: @balfikovich</i>"
     )
 
 
 def get_start_text() -> str:
+    # Используем HTML-теги для custom emoji через tg-emoji
     return (
-        f'<tg-emoji emoji-id="{E_START}">✨</tg-emoji> <b>NFT Gift Viewer</b>\n'
+        f'<tg-emoji emoji-id="{E_START}">✨</tg-emoji> <b>NFT Preview Bot</b>\n'
         "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
         "Показываю <b>видео-карточку</b> любого Telegram NFT-подарка.\n\n"
         "<b>📨 Как пользоваться в личке:</b>\n"
         "Отправь ссылку или название — получишь MP4 видео с подписью.\n\n"
         "<b>✅ Форматы:</b>\n"
-        "<code>https://t.me/nft/PlushPepe-22</code>\n"
-        "<code>t.me/nft/PlushPepe-22</code>\n"
-        "<code>PlushPepe-22</code>\n"
-        "<code>PlushPepe 22</code>\n"
-        "<code>Plush Pepe 22</code>\n\n"
+        f'<tg-emoji emoji-id="{E_FORMAT}">▪️</tg-emoji> <code>https://t.me/nft/PlushPepe-22</code>\n'
+        f'<tg-emoji emoji-id="{E_FORMAT}">▪️</tg-emoji> <code>t.me/nft/PlushPepe-22</code>\n'
+        f'<tg-emoji emoji-id="{E_FORMAT}">▪️</tg-emoji> <code>PlushPepe-22</code>\n'
+        f'<tg-emoji emoji-id="{E_FORMAT}">▪️</tg-emoji> <code>PlushPepe 22</code>\n'
+        f'<tg-emoji emoji-id="{E_FORMAT}">▪️</tg-emoji> <code>Plush Pepe 22</code>\n'
+        f'<tg-emoji emoji-id="{E_FORMAT}">▪️</tg-emoji> <code>Plush Pepe #22</code>\n'
+        f'<tg-emoji emoji-id="{E_FORMAT}">▪️</tg-emoji> <code>Plush Pepe №22</code>\n\n'
         "Под видео — кнопки <b>«Без анимации»</b> (PNG) и <b>«Скачать TGS»</b>.\n\n"
         "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
-        "<b>👥 В группе:</b>\n"
-        "🖼 <b>Статичная:</b> <code>превью Plush Pepe 22</code>\n"
-        "🎬 <b>Анимация MP4:</b> <code>+а превью Plush Pepe 22</code>\n"
-        "🎞 <b>Только GIF:</b> <code>+гиф превью Plush Pepe 22</code>\n"
-        "🎭 <b>TGS файл:</b> <code>+тгс превью Plush Pepe 22</code>\n\n"
+        f'<tg-emoji emoji-id="{E_GROUP}">👥</tg-emoji> <b>В группе:</b>\n'
+        f'<tg-emoji emoji-id="{E_FORMAT}">▪️</tg-emoji> <b>Статичная:</b> <code>превью Plush Pepe 22</code>\n'
+        f'<tg-emoji emoji-id="{E_FORMAT}">▪️</tg-emoji> <b>Анимация MP4:</b> <code>+а превью Plush Pepe 22</code>\n'
+        f'<tg-emoji emoji-id="{E_FORMAT}">▪️</tg-emoji> <b>Только GIF:</b> <code>+гиф превью Plush Pepe 22</code>\n'
+        f'<tg-emoji emoji-id="{E_FORMAT}">▪️</tg-emoji> <b>TGS файл:</b> <code>+тгс превью Plush Pepe 22</code>\n\n'
         "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
-        "<b>📋 Правила пользования:</b>\n\n"
-        "⏱ <b>Повторный показ</b> одного подарка — не чаще <b>1 раза в 2 минуты</b>\n"
-        "🔘 <b>Кнопки</b> под превью — только <b>1 раз каждая</b>\n"
-        "👥 <b>В чате</b> — не более <b>5 генераций</b> одновременно\n\n"
+        f'<tg-emoji emoji-id="{E_RULES}">📋</tg-emoji> <b>Правила пользования:</b>\n\n'
+        f'<tg-emoji emoji-id="{E_RULE_TIME}">⏱</tg-emoji> <b>Повторный показ</b> одного подарка — не чаще <b>1 раза в 2 минуты</b>\n'
+        f'<tg-emoji emoji-id="{E_RULE_SPAM}">🚫</tg-emoji> <b>Не спамить</b> в личке бота или в чате\n'
+        f'<tg-emoji emoji-id="{E_RULE_TIME}">👥</tg-emoji> <b>В чате</b> — не более <b>5 генераций</b> одновременно, после 5 остальные превью будут отправляться в очередь и это может занять какое-то время\n'
+        f'<tg-emoji emoji-id="{E_RULE_GEN}">⚡</tg-emoji> <b>Время генерации:</b> Видео ~10–25 сек | Картинка ~5–10 сек\n\n'
         "<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
-        "⚡ Видео ~5–15 сек | Картинка ~1–2 сек\n\n"
-        "<i>Автор: <a href='https://t.me/balfikovich'>@balfikovich</a></i>"
+        "<i>Автор: @balfikovich</i>"
     )
 
 
@@ -1844,7 +1842,7 @@ async def payment_handler(message: Message) -> None:
         "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
         f"Ты отправил <b>{stars} ⭐</b> — это очень приятно! 🚀\n\n"
         "Я обязательно напишу тебе лично, чтобы поблагодарить! 🙏\n\n"
-        f"<i>С уважением, <a href='https://t.me/balfikovich'>@balfikovich</a></i>",
+        "<i>С уважением, @balfikovich</i>",
         parse_mode=ParseMode.HTML,
     )
     try:
@@ -2263,7 +2261,7 @@ async def handle_text(message: Message) -> None:
                 await bot.send_invoice(
                     chat_id=message.chat.id,
                     title="⭐ Поддержка автора",
-                    description=f"Донат автору бота NFT Gift Viewer — {amount} звёзд. Спасибо! 🙏",
+                    description=f"Донат автору бота NFT Preview Bot — {amount} звёзд. Спасибо! 🙏",
                     payload=f"donate_{uid}_{amount}",
                     currency="XTR",
                     prices=[LabeledPrice(label="Звёзды", amount=amount)],
@@ -2694,9 +2692,11 @@ async def _handle_private_video(message: Message, raw: str) -> None:
         await message.answer(
             f'<tg-emoji emoji-id="{E_ERR}">❌</tg-emoji> <b>Неверный формат.</b>\n\n'
             "<b>Примеры:</b>\n"
-            "<code>Plush Pepe 22</code>\n"
-            "<code>t.me/nft/PlushPepe-22</code>\n"
-            "<code>https://t.me/nft/PlushPepe-22</code>",
+            f'<tg-emoji emoji-id="{E_FORMAT}">▪️</tg-emoji> <code>Plush Pepe 22</code>\n'
+            f'<tg-emoji emoji-id="{E_FORMAT}">▪️</tg-emoji> <code>Plush Pepe #22</code>\n'
+            f'<tg-emoji emoji-id="{E_FORMAT}">▪️</tg-emoji> <code>Plush Pepe №22</code>\n'
+            f'<tg-emoji emoji-id="{E_FORMAT}">▪️</tg-emoji> <code>t.me/nft/PlushPepe-22</code>\n'
+            f'<tg-emoji emoji-id="{E_FORMAT}">▪️</tg-emoji> <code>https://t.me/nft/PlushPepe-22</code>',
             parse_mode=ParseMode.HTML,
         )
         return
@@ -2846,12 +2846,12 @@ async def inline_handler(query: InlineQuery) -> None:
     if not raw:
         hint = InlineQueryResultArticle(
             id="hint",
-            title="🎁 NFT Gift Viewer",
+            title="🎁 NFT Preview Bot",
             description="Введите: Plush Pepe 22 / PlushPepe-22",
             thumbnail_url="https://nft.fragment.com/gift/PlushPepe-1.webp",
             input_message_content=InputTextMessageContent(
                 message_text=(
-                    "<b>NFT Gift Viewer</b>\n\n"
+                    "<b>NFT Preview Bot</b>\n\n"
                     "Добавь бота в чат и отправляй названия подарков!\n\n"
                     "<code>t.me/nft/PlushPepe-22</code>"
                 ),
