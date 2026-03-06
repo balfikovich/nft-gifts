@@ -213,6 +213,8 @@ _used_gif:               set[str]               = set()
 _awaiting_donate:        set[int]               = set()
 _last_instr:             dict[int, float]       = {}
 _last_button:            dict[str, float]       = {}
+# chat_id:prefix -> timestamp (кулдаун кнопки для всего чата)
+_last_button_chat:       dict[str, float]       = {}
 
 # ── Защита от спама одинаковыми slug (дедупликация) ──────────────────────────
 # uid -> set of slugs currently being processed
@@ -280,7 +282,8 @@ def _get_cb_lock(uid: int) -> asyncio.Lock:
     return _cb_locks[uid]
 
 ANTISPAM_INSTR_SEC  = 300
-ANTISPAM_BUTTON_SEC = 90.0
+ANTISPAM_BUTTON_SEC     = 90.0
+ANTISPAM_BUTTON_CHAT_SEC = 60.0  # 1 минута на весь чат после нажатия кнопки
 
 BOT_USERNAME: str = ""
 
@@ -635,6 +638,24 @@ def check_button_antispam(user_id: int, prefix: str) -> float:
         return round(ANTISPAM_BUTTON_SEC - diff, 1)
     _last_button[key] = now
     return 0.0
+
+
+def check_button_chat_antispam(chat_id: int, prefix: str) -> float:
+    """Кулдаун кнопки для всего чата (1 минута). Не применяется в личке."""
+    key  = f"chat:{chat_id}:{prefix}"
+    now  = time.monotonic()
+    last = _last_button_chat.get(key, 0.0)
+    diff = now - last
+    if diff < ANTISPAM_BUTTON_CHAT_SEC:
+        return round(ANTISPAM_BUTTON_CHAT_SEC - diff, 1)
+    _last_button_chat[key] = now
+    return 0.0
+
+
+def record_button_chat_use(chat_id: int, prefix: str) -> None:
+    """Записывает факт нажатия кнопки в чате."""
+    key = f"chat:{chat_id}:{prefix}"
+    _last_button_chat[key] = time.monotonic()
 
 
 # ── HTTP-сессия ───────────────────────────────────────────────────────────────
@@ -1559,6 +1580,7 @@ def get_start_text() -> str:
         f'<tg-emoji emoji-id="{E_RULE_TIME}">👥</tg-emoji> <b>В чате</b> — не более <b>5 генераций</b> одновременно, после 5 остальные превью будут отправляться в очередь и это может занять какое-то время\n'
         f'<tg-emoji emoji-id="{E_RULE_GEN}">⚡</tg-emoji> <b>Время генерации:</b> Видео ~10–25 сек | Картинка ~5–10 сек\n\n'
         "<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
+        "📢 <b>Новостной канал:</b> @NftPreviewByBalfikovich\n\n"
         "<i>Автор: @balfikovich</i>"
     )
 
@@ -1950,24 +1972,45 @@ def _fmt_wait(wait: float) -> str:
 
 @dp.callback_query(F.data.startswith(CB_NO_COMPRESS_VIDEO))
 async def callback_no_compress_video(callback: CallbackQuery) -> None:
-    uid  = callback.from_user.id
-    payload = callback.data[len(CB_NO_COMPRESS_VIDEO):]; slug = payload.split("|")[0]
-    mid  = callback.message.message_id
-    key  = f"{mid}:{slug.lower()}"
+    uid      = callback.from_user.id
+    is_admin = (uid == ADMIN_ID)
+    payload  = callback.data[len(CB_NO_COMPRESS_VIDEO):]; slug = payload.split("|")[0]
+    mid      = callback.message.message_id
+    key      = f"{mid}:{slug.lower()}"
+    chat_id  = callback.message.chat.id
+    is_group = callback.message.chat.type in ("group", "supergroup")
 
-    spam = record_spam_event(uid)
-    if spam in ("muted", "ban", "mute"):
-        await callback.answer("⏳ Слишком много запросов. Подожди немного.", show_alert=True)
-        return
+    if not is_admin:
+        spam = record_spam_event(uid)
+        if spam in ("muted", "ban", "mute"):
+            await callback.answer("⏳ Слишком много запросов. Подожди немного.", show_alert=True)
+            return
 
     if key in _used_no_compress_video:
         await callback.answer("❌ Видео без сжатия уже было отправлено!", show_alert=True)
         return
 
-    wait = check_button_antispam(uid, CB_NO_COMPRESS_VIDEO)
-    if wait > 0:
-        await callback.answer(f"⏳ Подожди ещё {_fmt_wait(wait)}", show_alert=False)
-        return
+    if not is_admin:
+        # Блокировка: если пользователь уже нажал другую кнопку этого превью
+        for other_prefix in (CB_SEND_GIF, CB_NO_ANIM, CB_SEND_STICKER, CB_NO_COMPRESS):
+            other_key = f"{uid}:{other_prefix}"
+            last = _last_button.get(other_key, 0.0)
+            if time.monotonic() - last < ANTISPAM_BUTTON_CHAT_SEC:
+                wait_other = round(ANTISPAM_BUTTON_CHAT_SEC - (time.monotonic() - last), 0)
+                await callback.answer(f"⏳ Подожди {_fmt_wait(wait_other)} — нажимать все кнопки сразу нельзя.", show_alert=True)
+                return
+        # Chat-level кулдаун в группах
+        if is_group:
+            chat_wait = check_button_chat_antispam(chat_id, CB_NO_COMPRESS_VIDEO)
+            if chat_wait > 0:
+                await callback.answer(f"⏳ В чате уже нажата кнопка. Подожди {_fmt_wait(chat_wait)}.", show_alert=True)
+                return
+        wait = check_button_antispam(uid, CB_NO_COMPRESS_VIDEO)
+        if wait > 0:
+            await callback.answer(f"⏳ Подожди ещё {_fmt_wait(wait)}", show_alert=False)
+            return
+    if is_group and not is_admin:
+        record_button_chat_use(chat_id, CB_NO_COMPRESS_VIDEO)
 
     lock = _get_cb_lock(uid)
     if lock.locked():
@@ -2011,24 +2054,43 @@ async def callback_no_compress_video(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith(CB_SEND_GIF))
 async def callback_send_gif(callback: CallbackQuery) -> None:
-    uid  = callback.from_user.id
-    payload = callback.data[len(CB_SEND_GIF):]; slug = payload.split("|")[0]
-    mid  = callback.message.message_id
-    key  = f"{mid}:{slug.lower()}"
+    uid      = callback.from_user.id
+    is_admin = (uid == ADMIN_ID)
+    payload  = callback.data[len(CB_SEND_GIF):]; slug = payload.split("|")[0]
+    mid      = callback.message.message_id
+    key      = f"{mid}:{slug.lower()}"
+    chat_id  = callback.message.chat.id
+    is_group = callback.message.chat.type in ("group", "supergroup")
 
-    spam = record_spam_event(uid)
-    if spam in ("muted", "ban", "mute"):
-        await callback.answer("⏳ Слишком много запросов. Подожди немного.", show_alert=True)
-        return
+    if not is_admin:
+        spam = record_spam_event(uid)
+        if spam in ("muted", "ban", "mute"):
+            await callback.answer("⏳ Слишком много запросов. Подожди немного.", show_alert=True)
+            return
 
     if key in _used_gif:
         await callback.answer("❌ GIF уже был отправлен!", show_alert=True)
         return
 
-    wait = check_button_antispam(uid, CB_SEND_GIF)
-    if wait > 0:
-        await callback.answer(f"⏳ Подожди ещё {_fmt_wait(wait)}", show_alert=False)
-        return
+    if not is_admin:
+        for other_prefix in (CB_NO_COMPRESS_VIDEO, CB_NO_ANIM, CB_SEND_STICKER, CB_NO_COMPRESS):
+            other_key = f"{uid}:{other_prefix}"
+            last = _last_button.get(other_key, 0.0)
+            if time.monotonic() - last < ANTISPAM_BUTTON_CHAT_SEC:
+                wait_other = round(ANTISPAM_BUTTON_CHAT_SEC - (time.monotonic() - last), 0)
+                await callback.answer(f"⏳ Подожди {_fmt_wait(wait_other)} — нажимать все кнопки сразу нельзя.", show_alert=True)
+                return
+        if is_group:
+            chat_wait = check_button_chat_antispam(chat_id, CB_SEND_GIF)
+            if chat_wait > 0:
+                await callback.answer(f"⏳ В чате уже нажата кнопка. Подожди {_fmt_wait(chat_wait)}.", show_alert=True)
+                return
+        wait = check_button_antispam(uid, CB_SEND_GIF)
+        if wait > 0:
+            await callback.answer(f"⏳ Подожди ещё {_fmt_wait(wait)}", show_alert=False)
+            return
+    if is_group and not is_admin:
+        record_button_chat_use(chat_id, CB_SEND_GIF)
 
     lock = _get_cb_lock(uid)
     if lock.locked():
@@ -2073,24 +2135,41 @@ async def callback_send_gif(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith(CB_NO_COMPRESS))
 async def callback_no_compress(callback: CallbackQuery) -> None:
-    uid  = callback.from_user.id
-    payload = callback.data[len(CB_NO_COMPRESS):]; slug = payload.split("|")[0]
-    mid  = callback.message.message_id
-    key  = f"{mid}:{slug.lower()}"
+    uid      = callback.from_user.id
+    is_admin = (uid == ADMIN_ID)
+    payload  = callback.data[len(CB_NO_COMPRESS):]; slug = payload.split("|")[0]
+    mid      = callback.message.message_id
+    key      = f"{mid}:{slug.lower()}"
+    chat_id  = callback.message.chat.id
+    is_group = callback.message.chat.type in ("group", "supergroup")
 
-    spam = record_spam_event(uid)
-    if spam in ("muted", "ban", "mute"):
-        await callback.answer("⏳ Слишком много запросов. Подожди немного.", show_alert=True)
-        return
-
-    wait = check_button_antispam(uid, CB_NO_COMPRESS)
-    if wait > 0:
-        await callback.answer(f"⏳ Подожди ещё {_fmt_wait(wait)}", show_alert=False)
-        return
+    if not is_admin:
+        spam = record_spam_event(uid)
+        if spam in ("muted", "ban", "mute"):
+            await callback.answer("⏳ Слишком много запросов. Подожди немного.", show_alert=True)
+            return
+        for other_prefix in (CB_NO_COMPRESS_VIDEO, CB_SEND_GIF, CB_NO_ANIM, CB_SEND_STICKER):
+            other_key = f"{uid}:{other_prefix}"
+            last = _last_button.get(other_key, 0.0)
+            if time.monotonic() - last < ANTISPAM_BUTTON_CHAT_SEC:
+                wait_other = round(ANTISPAM_BUTTON_CHAT_SEC - (time.monotonic() - last), 0)
+                await callback.answer(f"⏳ Подожди {_fmt_wait(wait_other)} — нажимать все кнопки сразу нельзя.", show_alert=True)
+                return
+        if is_group:
+            chat_wait = check_button_chat_antispam(chat_id, CB_NO_COMPRESS)
+            if chat_wait > 0:
+                await callback.answer(f"⏳ В чате уже нажата кнопка. Подожди {_fmt_wait(chat_wait)}.", show_alert=True)
+                return
+        wait = check_button_antispam(uid, CB_NO_COMPRESS)
+        if wait > 0:
+            await callback.answer(f"⏳ Подожди ещё {_fmt_wait(wait)}", show_alert=False)
+            return
 
     if key in _used_no_compress:
         await callback.answer("❌ Оригинал уже был отправлен!", show_alert=True)
         return
+    if is_group and not is_admin:
+        record_button_chat_use(chat_id, CB_NO_COMPRESS)
 
     lock = _get_cb_lock(uid)
     if lock.locked():
@@ -2126,24 +2205,43 @@ async def callback_no_compress(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith(CB_NO_ANIM))
 async def callback_no_anim(callback: CallbackQuery) -> None:
-    uid  = callback.from_user.id
-    payload = callback.data[len(CB_NO_ANIM):]; slug = payload.split("|")[0]
-    mid  = callback.message.message_id
-    key  = f"{mid}:{slug.lower()}"
+    uid      = callback.from_user.id
+    is_admin = (uid == ADMIN_ID)
+    payload  = callback.data[len(CB_NO_ANIM):]; slug = payload.split("|")[0]
+    mid      = callback.message.message_id
+    key      = f"{mid}:{slug.lower()}"
+    chat_id  = callback.message.chat.id
+    is_group = callback.message.chat.type in ("group", "supergroup")
 
-    spam = record_spam_event(uid)
-    if spam in ("muted", "ban", "mute"):
-        await callback.answer("⏳ Слишком много запросов. Подожди немного.", show_alert=True)
-        return
+    if not is_admin:
+        spam = record_spam_event(uid)
+        if spam in ("muted", "ban", "mute"):
+            await callback.answer("⏳ Слишком много запросов. Подожди немного.", show_alert=True)
+            return
 
     if key in _used_no_anim:
         await callback.answer("❌ Картинка уже была отправлена!", show_alert=True)
         return
 
-    wait = check_button_antispam(uid, CB_NO_ANIM)
-    if wait > 0:
-        await callback.answer(f"⏳ Подожди ещё {_fmt_wait(wait)}", show_alert=False)
-        return
+    if not is_admin:
+        for other_prefix in (CB_NO_COMPRESS_VIDEO, CB_SEND_GIF, CB_SEND_STICKER, CB_NO_COMPRESS):
+            other_key = f"{uid}:{other_prefix}"
+            last = _last_button.get(other_key, 0.0)
+            if time.monotonic() - last < ANTISPAM_BUTTON_CHAT_SEC:
+                wait_other = round(ANTISPAM_BUTTON_CHAT_SEC - (time.monotonic() - last), 0)
+                await callback.answer(f"⏳ Подожди {_fmt_wait(wait_other)} — нажимать все кнопки сразу нельзя.", show_alert=True)
+                return
+        if is_group:
+            chat_wait = check_button_chat_antispam(chat_id, CB_NO_ANIM)
+            if chat_wait > 0:
+                await callback.answer(f"⏳ В чате уже нажата кнопка. Подожди {_fmt_wait(chat_wait)}.", show_alert=True)
+                return
+        wait = check_button_antispam(uid, CB_NO_ANIM)
+        if wait > 0:
+            await callback.answer(f"⏳ Подожди ещё {_fmt_wait(wait)}", show_alert=False)
+            return
+    if is_group and not is_admin:
+        record_button_chat_use(chat_id, CB_NO_ANIM)
 
     lock = _get_cb_lock(uid)
     if lock.locked():
@@ -2185,24 +2283,43 @@ async def callback_no_anim(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith(CB_SEND_STICKER))
 async def callback_send_sticker(callback: CallbackQuery) -> None:
-    uid  = callback.from_user.id
-    payload = callback.data[len(CB_SEND_STICKER):]; slug = payload.split("|")[0]
-    mid  = callback.message.message_id
-    key  = f"{mid}:{slug.lower()}"
+    uid      = callback.from_user.id
+    is_admin = (uid == ADMIN_ID)
+    payload  = callback.data[len(CB_SEND_STICKER):]; slug = payload.split("|")[0]
+    mid      = callback.message.message_id
+    key      = f"{mid}:{slug.lower()}"
+    chat_id  = callback.message.chat.id
+    is_group = callback.message.chat.type in ("group", "supergroup")
 
-    spam = record_spam_event(uid)
-    if spam in ("muted", "ban", "mute"):
-        await callback.answer("⏳ Слишком много запросов. Подожди немного.", show_alert=True)
-        return
+    if not is_admin:
+        spam = record_spam_event(uid)
+        if spam in ("muted", "ban", "mute"):
+            await callback.answer("⏳ Слишком много запросов. Подожди немного.", show_alert=True)
+            return
 
     if key in _used_sticker:
         await callback.answer("❌ Стикер уже был отправлен!", show_alert=True)
         return
 
-    wait = check_button_antispam(uid, CB_SEND_STICKER)
-    if wait > 0:
-        await callback.answer(f"⏳ Подожди ещё {_fmt_wait(wait)}", show_alert=False)
-        return
+    if not is_admin:
+        for other_prefix in (CB_NO_COMPRESS_VIDEO, CB_SEND_GIF, CB_NO_ANIM, CB_NO_COMPRESS):
+            other_key = f"{uid}:{other_prefix}"
+            last = _last_button.get(other_key, 0.0)
+            if time.monotonic() - last < ANTISPAM_BUTTON_CHAT_SEC:
+                wait_other = round(ANTISPAM_BUTTON_CHAT_SEC - (time.monotonic() - last), 0)
+                await callback.answer(f"⏳ Подожди {_fmt_wait(wait_other)} — нажимать все кнопки сразу нельзя.", show_alert=True)
+                return
+        if is_group:
+            chat_wait = check_button_chat_antispam(chat_id, CB_SEND_STICKER)
+            if chat_wait > 0:
+                await callback.answer(f"⏳ В чате уже нажата кнопка. Подожди {_fmt_wait(chat_wait)}.", show_alert=True)
+                return
+        wait = check_button_antispam(uid, CB_SEND_STICKER)
+        if wait > 0:
+            await callback.answer(f"⏳ Подожди ещё {_fmt_wait(wait)}", show_alert=False)
+            return
+    if is_group and not is_admin:
+        record_button_chat_use(chat_id, CB_SEND_STICKER)
 
     lock = _get_cb_lock(uid)
     if lock.locked():
