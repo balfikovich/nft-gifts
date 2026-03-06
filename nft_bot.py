@@ -1043,14 +1043,9 @@ def _get_lottie_native_size(tgs_path: str) -> tuple[int, int]:
 
 def tgs_to_mp4(tgs_bytes: bytes) -> Optional[bytes]:
     """
-    Конвертирует TGS → MP4 высокого качества.
-
-    Стратегия:
-    - rlottie рендерит в нативный размер (512×512 для большинства TGS)
-    - Кадры сохраняются как PNG без сжатия (lossless)
-    - ffmpeg масштабирует до 800×800 через lanczos + чёткость unsharp
-    - CRF 18 medium — оптимальный баланс качество/скорость
-    - Fallback на CRF 23 если что-то пошло не так
+    Конвертирует TGS → MP4.
+    Рендерим в нативный размер (512px) без растяжки — пиксель в пиксель.
+    ffmpeg: CRF 15, preset medium, tune animation.
     """
     try:
         from rlottie_python import LottieAnimation
@@ -1058,10 +1053,6 @@ def tgs_to_mp4(tgs_bytes: bytes) -> Optional[bytes]:
     except ImportError as e:
         logger.error("tgs_to_mp4: не хватает библиотеки: %s", e)
         return None
-
-    # 800px — оптимальный размер: заметно лучше 512, не перегружает сервер
-    # Telegram сам сожмёт выше 720p при воспроизведении, поэтому 800 — потолок
-    TARGET_SIZE = 800
 
     tmp_dir    = tempfile.mkdtemp(prefix="nft_mp4_")
     tgs_path   = os.path.join(tmp_dir, "anim.tgs")
@@ -1073,25 +1064,21 @@ def tgs_to_mp4(tgs_bytes: bytes) -> Optional[bytes]:
             f.write(tgs_bytes)
 
         native_w, native_h = _get_lottie_native_size(tgs_path)
-        native_size = max(native_w, native_h)
+        render_size = max(native_w, native_h)
         logger.info("tgs_to_mp4: нативный размер TGS = %dx%d", native_w, native_h)
 
-        # Рендерим строго в нативный размер — это гарантированно работает
-        # Апскейл до TARGET_SIZE делает ffmpeg (lanczos) — быстро и качественно
         anim = None
-        actual_render_size = native_size
-        for try_size in [native_size, 512]:
+        for try_size in [render_size, 512]:
             try:
                 a = LottieAnimation.from_tgs(tgs_path, width=try_size, height=try_size)
                 f0 = a.render_pillow_frame(frame_num=0)
                 if f0 is not None:
                     anim = a
-                    actual_render_size = try_size
+                    render_size = try_size
                     logger.info("tgs_to_mp4: рендер %dx%d OK", try_size, try_size)
                     break
             except Exception as e:
                 logger.debug("tgs_to_mp4 from_tgs(size=%d) failed: %s", try_size, e)
-                continue
 
         if anim is None:
             logger.error("tgs_to_mp4: не удалось создать анимацию")
@@ -1107,8 +1094,7 @@ def tgs_to_mp4(tgs_bytes: bytes) -> Optional[bytes]:
         fps = max(fps, 1)
         os.makedirs(frames_dir, exist_ok=True)
 
-        # Рендерим все кадры подряд без пропусков — строгая нумерация 00000..N
-        saved = 0
+        # Строгая нумерация 00000..N — никаких пропусков
         for i in range(frame_count):
             try:
                 frame_img = anim.render_pillow_frame(frame_num=i)
@@ -1116,10 +1102,8 @@ def tgs_to_mp4(tgs_bytes: bytes) -> Optional[bytes]:
                 frame_img = None
 
             if frame_img is None:
-                # Вставляем пустой чёрный кадр чтобы не ломать нумерацию
-                frame_img = Image.new("RGB", (actual_render_size, actual_render_size), (0, 0, 0))
+                frame_img = Image.new("RGB", (render_size, render_size), (0, 0, 0))
 
-            # Приводим к квадрату
             w, h = frame_img.size
             if w != h:
                 side = max(w, h)
@@ -1128,7 +1112,6 @@ def tgs_to_mp4(tgs_bytes: bytes) -> Optional[bytes]:
                 sq.paste(frame_img, ((side - w) // 2, (side - h) // 2))
                 frame_img = sq
 
-            # RGBA → RGB (чёрный фон)
             if frame_img.mode == "RGBA":
                 bg = Image.new("RGB", frame_img.size, (0, 0, 0))
                 bg.paste(frame_img, mask=frame_img.split()[3])
@@ -1140,54 +1123,30 @@ def tgs_to_mp4(tgs_bytes: bytes) -> Optional[bytes]:
                 os.path.join(frames_dir, f"frame_{i:05d}.png"),
                 format="PNG", compress_level=0,
             )
-            saved += 1
 
-        if saved == 0:
-            logger.error("tgs_to_mp4: ни один кадр не сохранён")
-            return None
-
-        logger.info("tgs_to_mp4: сохранено %d кадров, render=%dpx → %dpx",
-                    saved, actual_render_size, TARGET_SIZE)
+        logger.info("tgs_to_mp4: сохранено %d кадров %dpx, кодирую...", frame_count, render_size)
 
         frames_input = os.path.join(frames_dir, "frame_%05d.png")
 
-        # scale до TARGET_SIZE через lanczos + лёгкий unsharp для резкости
-        vf_filter = (
-            f"scale={TARGET_SIZE}:{TARGET_SIZE}:flags=lanczos,"
-            "unsharp=3:3:0.5:3:3:0.0"
-        )
-
+        # Без scale — нативный размер, без потерь на интерполяции
         cmds = [
-            # Основная: CRF 18 medium — хорошее качество, быстрая конвертация (~5-10 сек)
             ["ffmpeg", "-y",
              "-framerate", str(fps),
              "-i", frames_input,
-             "-vf", vf_filter,
              "-c:v", "libx264", "-pix_fmt", "yuv420p",
-             "-crf", "18",
+             "-crf", "15",
              "-preset", "medium",
              "-profile:v", "high", "-level:v", "4.1",
              "-tune", "animation",
              "-movflags", "+faststart",
              mp4_path],
 
-            # Fallback: без scale-фильтра (если vf сломался)
+            # Fallback: минимальные параметры
             ["ffmpeg", "-y",
              "-framerate", str(fps),
              "-i", frames_input,
              "-c:v", "libx264", "-pix_fmt", "yuv420p",
              "-crf", "18",
-             "-preset", "medium",
-             "-profile:v", "high", "-level:v", "4.1",
-             "-movflags", "+faststart",
-             mp4_path],
-
-            # Последний резерв: минимальные параметры
-            ["ffmpeg", "-y",
-             "-framerate", str(fps),
-             "-i", frames_input,
-             "-c:v", "libx264", "-pix_fmt", "yuv420p",
-             "-crf", "23",
              mp4_path],
         ]
 
@@ -1195,18 +1154,16 @@ def tgs_to_mp4(tgs_bytes: bytes) -> Optional[bytes]:
             r = subprocess.run(cmd, capture_output=True, timeout=300)
             if r.returncode == 0 and os.path.exists(mp4_path) and os.path.getsize(mp4_path) > 0:
                 size_kb = os.path.getsize(mp4_path) // 1024
-                logger.info("tgs_to_mp4: OK попытка %d | %d кадров | %.1f fps | %dpx | %dKB",
-                            attempt, frame_count, fps, TARGET_SIZE, size_kb)
+                logger.info("tgs_to_mp4 OK: %d кадров | %.0ffps | %dpx | %dKB | попытка %d",
+                            frame_count, fps, render_size, size_kb, attempt)
                 break
-            err_tail = r.stderr.decode(errors="replace")[-300:]
-            logger.warning("tgs_to_mp4: попытка %d failed: %s", attempt, err_tail)
+            logger.warning("tgs_to_mp4: попытка %d failed: %s",
+                           attempt, r.stderr.decode(errors="replace")[-300:])
         else:
             return None
 
         with open(mp4_path, "rb") as f:
-            mp4_data = f.read()
-
-        return mp4_data
+            return f.read()
 
     except subprocess.TimeoutExpired:
         logger.error("tgs_to_mp4: timeout")
@@ -1215,10 +1172,7 @@ def tgs_to_mp4(tgs_bytes: bytes) -> Optional[bytes]:
         logger.error("tgs_to_mp4 error: %s", e, exc_info=True)
         return None
     finally:
-        try:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-        except Exception:
-            pass
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 def tgs_to_gif(tgs_bytes: bytes, size: int = 800) -> Optional[bytes]:
     try:
         from rlottie_python import LottieAnimation
