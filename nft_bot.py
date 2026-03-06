@@ -823,13 +823,16 @@ async def fetch_nft_attrs(slug: str) -> NftAttrs:
 #  FLOOR PRICE (giftstat.app)
 # ══════════════════════════════════════════════════════════════════════════════
 
-FLOOR_API_URL = "https://apiv2.giftstat.app/current/collections/floor"
+FLOOR_API_URL       = "https://apiv2.giftstat.app/current/collections/floor"
+FLOOR_MODEL_API_URL = "https://apiv2.giftstat.app/current/collections/models/floor"
 
-_floor_cache: dict[str, tuple[float, float, float]] = {}
 _floor_cache_ttl: float = 60.0
 
 _floor_data_all: list[dict] = []
-_floor_data_ts: float = 0.0
+_floor_data_ts:  float      = 0.0
+
+_floor_model_data_all: list[dict] = []
+_floor_model_data_ts:  float      = 0.0
 
 
 async def _refresh_floor_data() -> bool:
@@ -858,6 +861,38 @@ async def _refresh_floor_data() -> bool:
         return False
 
 
+async def _refresh_floor_model_data() -> bool:
+    global _floor_model_data_all, _floor_model_data_ts
+    now = time.monotonic()
+    if now - _floor_model_data_ts < _floor_cache_ttl and _floor_model_data_all:
+        return True
+    try:
+        async with get_session().get(FLOOR_MODEL_API_URL, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                logger.warning("floor_model_api HTTP %s", resp.status)
+                return False
+            payload = await resp.json(content_type=None)
+            data = payload.get("data") if isinstance(payload, dict) else payload
+            if not isinstance(data, list):
+                logger.warning("floor_model_api: unexpected format")
+                return False
+            _floor_model_data_all = data
+            _floor_model_data_ts  = now
+            return True
+    except asyncio.TimeoutError:
+        logger.warning("floor_model_api timeout")
+        return False
+    except Exception as e:
+        logger.warning("floor_model_api error: %s", e)
+        return False
+
+
+def _format_ton(value: float) -> str:
+    if value == int(value):
+        return str(int(value))
+    return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
 def _format_usd(value: float) -> str:
     if value >= 100:
         return f"{value:.0f}"
@@ -869,6 +904,7 @@ def _format_usd(value: float) -> str:
 
 
 async def fetch_floor_price(collection_name: str) -> tuple[Optional[float], Optional[float]]:
+    """Возвращает (floor_price_TON, ton_rate_USD) для коллекции."""
     ok = await _refresh_floor_data()
     if not ok:
         return None, None
@@ -896,6 +932,45 @@ async def fetch_floor_price(collection_name: str) -> tuple[Optional[float], Opti
         except (ValueError, TypeError):
             pass
     return None, None
+
+
+async def fetch_model_floor_price(collection_name: str, model_name: str) -> Optional[float]:
+    """
+    Возвращает floor_price в TON для конкретной модели в коллекции.
+    Сначала ищет совпадение по коллекции, затем по модели внутри неё —
+    чтобы избежать путаницы с одинаковыми именами моделей в разных коллекциях.
+    """
+    if not model_name or model_name == "—":
+        return None
+
+    ok = await _refresh_floor_model_data()
+    if not ok:
+        return None
+
+    cname_lower = collection_name.lower().strip()
+    cname_slug  = _slug_key(collection_name)
+    mname_lower = model_name.lower().strip()
+    mname_slug  = _slug_key(model_name)
+
+    for item in _floor_model_data_all:
+        item_col = str(item.get("collection", "")).lower().strip()
+        item_mod = str(item.get("model", "")).lower().strip()
+
+        col_match = (item_col == cname_lower) or (_slug_key(item_col) == cname_slug)
+        if not col_match:
+            continue
+
+        mod_match = (item_mod == mname_lower) or (_slug_key(item_mod) == mname_slug)
+        if mod_match:
+            fp = item.get("floor_price")
+            if fp is not None:
+                try:
+                    return float(fp)
+                except (ValueError, TypeError):
+                    pass
+            return None
+
+    return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1335,7 +1410,8 @@ def _utf16_len(s: str) -> int:
 
 def make_caption(slug: str, attrs: NftAttrs,
                  floor_price: Optional[float] = None,
-                 ton_rate: Optional[float] = None) -> tuple[str, list[MessageEntity]]:
+                 ton_rate: Optional[float] = None,
+                 model_floor_price: Optional[float] = None) -> tuple[str, list[MessageEntity]]:
     name, number = split_slug(slug)
     nice = normalize_gift_name(name)
 
@@ -1397,15 +1473,12 @@ def make_caption(slug: str, attrs: NftAttrs,
     # ── Заголовок ─────────────────────────────────────────────────────────────
     ce("🎁", E_GIFT); p(" "); bold(title_text); p("\n")
 
-    # ── Floor price строка ────────────────────────────────────────────────────
+    # ── Floor price коллекции ─────────────────────────────────────────────────
     try:
         if floor_price is not None and ton_rate is not None:
             usd_val = floor_price * ton_rate
             usd_str = _format_usd(usd_val)
-            if floor_price == int(floor_price):
-                ton_str = str(int(floor_price))
-            else:
-                ton_str = f"{floor_price:.2f}".rstrip("0").rstrip(".")
+            ton_str = _format_ton(floor_price)
             ce("💎", E_FLOOR_GEM)
             bold(" Floorprice collection — ")
             ce("❤️", E_FLOOR_TON)
@@ -1423,12 +1496,25 @@ def make_caption(slug: str, attrs: NftAttrs,
 
     code(SEP); p("\n")
 
+    # ── Строка модели ─────────────────────────────────────────────────────────
     ce("🪄", E_MODEL); p(" "); bold("Модель:"); p(f" {attrs.model}")
     if is_crafted:
         p(" · ")
         rarity_emojis(craft_rarity)
     elif attrs.model_rarity:
         p(f" · {attrs.model_rarity}")
+    # ── Floor price модели ────────────────────────────────────────────────────
+    try:
+        if model_floor_price is not None and ton_rate is not None:
+            mfp_ton = _format_ton(model_floor_price)
+            mfp_usd = _format_usd(model_floor_price * ton_rate)
+            p(" · ")
+            bold(mfp_ton)
+            bold(" TON (")
+            bold_italic(f"~${mfp_usd}")
+            bold(")")
+    except Exception:
+        pass
     p("\n")
 
     r_back = f" · {attrs.backdrop_rarity}" if attrs.backdrop_rarity else ""
@@ -1495,7 +1581,8 @@ def get_group_instruction() -> str:
         f'<tg-emoji emoji-id="{E_RULE_GEN}">⚡</tg-emoji> <b>Время генерации:</b> Видео ~10–25 сек | Картинка ~5–10 сек\n\n'
         "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
         "<b>❓ Нужна помощь?</b>\n"
-        "Пиши автору: @balfikovich"
+        "Пиши автору: @balfikovich\n\n"
+        "📢 <b>Новостной канал:</b> @NftPreviewByBalfikovich"
     )
 
 
@@ -1586,8 +1673,9 @@ async def send_static_photo(message: Message, png: bytes,
                             slug: str, attrs: NftAttrs,
                             floor_price: Optional[float] = None,
                             ton_rate: Optional[float] = None,
+                            model_floor_price: Optional[float] = None,
                             reply_to: Optional[int] = None) -> bool:
-    caption, ents = make_caption(slug, attrs, floor_price, ton_rate)
+    caption, ents = make_caption(slug, attrs, floor_price, ton_rate, model_floor_price)
     expire_ts = int(time.time() + PREVIEW_TTL)
     kbd  = make_keyboard_static(slug, expire_ts)
     file = BufferedInputFile(png, filename=f"{slug}.png")
@@ -1629,8 +1717,9 @@ async def send_video(message: Message, mp4: bytes,
                      slug: str, attrs: NftAttrs,
                      floor_price: Optional[float] = None,
                      ton_rate: Optional[float] = None,
+                     model_floor_price: Optional[float] = None,
                      reply_to: Optional[int] = None) -> bool:
-    caption, ents = make_caption(slug, attrs, floor_price, ton_rate)
+    caption, ents = make_caption(slug, attrs, floor_price, ton_rate, model_floor_price)
     expire_ts = int(time.time() + PREVIEW_TTL)
     kbd  = make_keyboard_video(slug, expire_ts)
     file = BufferedInputFile(mp4, filename=f"{slug}.mp4")
@@ -2156,10 +2245,11 @@ async def callback_no_anim(callback: CallbackQuery) -> None:
             name_part, _ = split_slug(slug)
             nice_name = normalize_gift_name(name_part)
             floor_price, ton_rate = await fetch_floor_price(nice_name)
+            model_floor_price = await fetch_model_floor_price(nice_name, attrs.model)
 
             _used_no_anim.add(key)
             await remove_keyboard_button(callback.message, CB_NO_ANIM)
-            ok = await send_static_photo(callback.message, png, slug, attrs, floor_price, ton_rate)
+            ok = await send_static_photo(callback.message, png, slug, attrs, floor_price, ton_rate, model_floor_price)
             if not ok:
                 await send_document(callback.message.answer_document, png, f"{slug}.png")
             user_log.info("🖼 БЕЗ АНИМАЦИИ | slug=%s | %s", slug, _u(callback.from_user))
@@ -2622,9 +2712,10 @@ async def _handle_group_static(message: Message, raw: str) -> None:
     user_log.info("✅ СТАТИК (группа) | slug=%s | модель=%s | %s | %.2fс",
                   slug, attrs.model, _u(message.from_user), elapsed)
 
+    model_floor_price = await fetch_model_floor_price(nice_name, attrs.model)
     png = webp_to_png(webp)
     if png:
-        ok = await send_static_photo(message, png, slug, attrs, floor_price, ton_rate,
+        ok = await send_static_photo(message, png, slug, attrs, floor_price, ton_rate, model_floor_price,
                                      reply_to=reply_to)
         if not ok:
             await send_document(message.answer_document, webp, f"{slug}.webp")
@@ -2726,8 +2817,10 @@ async def _handle_group_video(message: Message, raw: str) -> None:
     await safe_delete(wm)
     elapsed = round(time.monotonic() - t0, 2)
 
+    model_floor_price = await fetch_model_floor_price(nice_name, attrs.model)
+
     if mp4_data:
-        ok = await send_video(message, mp4_data, slug, attrs, floor_price, ton_rate,
+        ok = await send_video(message, mp4_data, slug, attrs, floor_price, ton_rate, model_floor_price,
                               reply_to=reply_to)
         if ok:
             user_log.info("✅ MP4 (группа) | slug=%s | %s | %.2fс",
@@ -2737,7 +2830,7 @@ async def _handle_group_video(message: Message, raw: str) -> None:
     if img_ok and webp:
         png = webp_to_png(webp)
         if png:
-            ok = await send_static_photo(message, png, slug, attrs, floor_price, ton_rate,
+            ok = await send_static_photo(message, png, slug, attrs, floor_price, ton_rate, model_floor_price,
                                          reply_to=reply_to)
             if ok:
                 return
@@ -2879,8 +2972,10 @@ async def _handle_private_video(message: Message, raw: str) -> None:
     elapsed = round(time.monotonic() - t0, 2)
     _dedup_release(uid, slug)
 
+    model_floor_price = await fetch_model_floor_price(nice_name, attrs.model)
+
     if mp4_data:
-        ok = await send_video(message, mp4_data, slug, attrs, floor_price, ton_rate)
+        ok = await send_video(message, mp4_data, slug, attrs, floor_price, ton_rate, model_floor_price)
         if ok:
             user_log.info("✅ MP4 ОТПРАВЛЕНО | slug=%s | %s | %.2fс",
                           slug, _u(message.from_user), elapsed)
@@ -2889,7 +2984,7 @@ async def _handle_private_video(message: Message, raw: str) -> None:
     if img_ok and webp:
         png = webp_to_png(webp)
         if png:
-            ok = await send_static_photo(message, png, slug, attrs, floor_price, ton_rate)
+            ok = await send_static_photo(message, png, slug, attrs, floor_price, ton_rate, model_floor_price)
             if ok:
                 return
         await send_document(message.answer_document, webp, f"{slug}.webp")
@@ -2972,7 +3067,8 @@ async def inline_handler(query: InlineQuery) -> None:
         await query.answer(results=[nf], cache_time=10, is_personal=True)
         return
 
-    caption, ents = make_caption(slug, attrs, floor_price, ton_rate)
+    model_floor_price = await fetch_model_floor_price(nice, attrs.model)
+    caption, ents = make_caption(slug, attrs, floor_price, ton_rate, model_floor_price)
     kbd = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🔗 Открыть в Telegram", url=f"https://t.me/nft/{slug}")
     ]])
