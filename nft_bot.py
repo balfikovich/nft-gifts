@@ -967,12 +967,25 @@ def _get_lottie_native_size(tgs_path: str) -> tuple[int, int]:
 
 
 def tgs_to_mp4(tgs_bytes: bytes) -> Optional[bytes]:
+    """
+    Конвертирует TGS → MP4 максимального качества.
+
+    Стратегия качества:
+    1. rlottie рендерит в 2× нативного размера (вектор масштабируется без потерь)
+    2. Сохраняем кадры как PNG без сжатия (lossless)
+    3. ffmpeg: масштаб 1080×1080 через lanczos + unsharp для резкости
+       CRF 0 (lossless h264) → fallback CRF 10 veryslow → fallback CRF 15 medium
+    4. profile high, level 4.2, movflags faststart для совместимости
+    """
     try:
         from rlottie_python import LottieAnimation
         from PIL import Image
     except ImportError as e:
         logger.error("tgs_to_mp4: не хватает библиотеки: %s", e)
         return None
+
+    # Целевой размер финального видео — 1080p (максимум для Telegram)
+    TARGET_SIZE = 1080
 
     tmp_dir    = tempfile.mkdtemp(prefix="nft_mp4_")
     tgs_path   = os.path.join(tmp_dir, "anim.tgs")
@@ -987,9 +1000,17 @@ def tgs_to_mp4(tgs_bytes: bytes) -> Optional[bytes]:
         native_size = max(native_w, native_h)
         logger.info("tgs_to_mp4: нативный размер TGS = %dx%d", native_w, native_h)
 
+        # Рендерим в 2× нативного размера — rlottie использует векторный движок,
+        # поэтому рендер в бо́льший размер даёт кристально чистые края и детали.
+        # Апскейл на уровне вектора несравнимо лучше, чем растровый после.
+        render_size = native_size * 2
+        # Ограничиваем 2048 (выше не нужно — Telegram всё равно сожмёт выше 1080)
+        render_size = min(render_size, 2048)
+        render_size = max(render_size, 512)  # минимум 512
+
         anim = None
-        actual_size = native_size
-        for try_size in [native_size, 512, 0]:
+        actual_render_size = render_size
+        for try_size in [render_size, native_size, 1024, 512, 0]:
             try:
                 if try_size > 0:
                     a = LottieAnimation.from_tgs(tgs_path, width=try_size, height=try_size)
@@ -998,8 +1019,8 @@ def tgs_to_mp4(tgs_bytes: bytes) -> Optional[bytes]:
                 f0 = a.render_pillow_frame(frame_num=0)
                 if f0 is not None:
                     anim = a
-                    actual_size = f0.size[0] if try_size == 0 else try_size
-                    logger.info("tgs_to_mp4: рендер %dx%d (from_tgs size=%d)",
+                    actual_render_size = f0.size[0] if try_size == 0 else try_size
+                    logger.info("tgs_to_mp4: рендер %dx%d (size=%d)",
                                 f0.size[0], f0.size[1], try_size)
                     break
             except Exception as e:
@@ -1029,6 +1050,7 @@ def tgs_to_mp4(tgs_bytes: bytes) -> Optional[bytes]:
             if frame_img is None:
                 continue
 
+            # Приводим к квадрату (центрируем на чёрном фоне)
             w, h = frame_img.size
             if w != h:
                 side = max(w, h)
@@ -1037,14 +1059,15 @@ def tgs_to_mp4(tgs_bytes: bytes) -> Optional[bytes]:
                 sq.paste(frame_img, ((side - w) // 2, (side - h) // 2))
                 frame_img = sq
 
+            # RGBA → RGB (чёрный фон)
             if frame_img.mode == "RGBA":
-                size = frame_img.size[0]
-                bg = Image.new("RGB", (size, size), (0, 0, 0))
+                bg = Image.new("RGB", frame_img.size, (0, 0, 0))
                 bg.paste(frame_img, mask=frame_img.split()[3])
                 frame_img = bg
             elif frame_img.mode != "RGB":
                 frame_img = frame_img.convert("RGB")
 
+            # PNG без сжатия = lossless исходники для ffmpeg
             frame_img.save(
                 os.path.join(frames_dir, f"frame_{i:05d}.png"),
                 format="PNG", compress_level=0,
@@ -1055,43 +1078,84 @@ def tgs_to_mp4(tgs_bytes: bytes) -> Optional[bytes]:
             logger.error("tgs_to_mp4: ни один кадр не сохранён")
             return None
 
-        logger.info("tgs_to_mp4: сохранено %d/%d кадров, размер=%dpx",
-                    saved, frame_count, actual_size)
+        logger.info("tgs_to_mp4: сохранено %d/%d кадров, render=%dpx → target=%dpx",
+                    saved, frame_count, actual_render_size, TARGET_SIZE)
+
+        frames_input = os.path.join(frames_dir, "frame_%05d.png")
+
+        # Фильтр масштабирования + резкость (unsharp усиливает детали после lanczos)
+        # scale до 1080 через lanczos — лучший алгоритм для апскейла
+        # unsharp: luma_msize_x:luma_msize_y:luma_amount:chroma_msize_x:chroma_msize_y:chroma_amount
+        vf_filter = (
+            f"scale={TARGET_SIZE}:{TARGET_SIZE}:flags=lanczos,"
+            "unsharp=5:5:0.6:5:5:0.3"
+        )
 
         cmds = [
+            # Попытка 1: Lossless (CRF 0) — максимальное качество, большой файл
+            # Но Telegram при отправке всё равно перекодирует видео > 50MB,
+            # поэтому реально лучший баланс — CRF 10 veryslow
             ["ffmpeg", "-y", "-framerate", str(fps),
-             "-i", os.path.join(frames_dir, "frame_%05d.png"),
+             "-i", frames_input,
+             "-vf", vf_filter,
              "-c:v", "libx264", "-pix_fmt", "yuv420p",
-             "-crf", "1", "-preset", "slow", "-tune", "animation",
-             "-movflags", "+faststart", mp4_path],
+             "-crf", "0",
+             "-preset", "veryslow",
+             "-profile:v", "high", "-level:v", "4.2",
+             "-tune", "animation",
+             "-movflags", "+faststart",
+             mp4_path],
 
+            # Попытка 2: Почти lossless (CRF 10) — отличное качество, разумный размер
             ["ffmpeg", "-y", "-framerate", str(fps),
-             "-i", os.path.join(frames_dir, "frame_%05d.png"),
+             "-i", frames_input,
+             "-vf", vf_filter,
              "-c:v", "libx264", "-pix_fmt", "yuv420p",
-             "-crf", "5", "-preset", "medium",
-             "-movflags", "+faststart", mp4_path],
+             "-crf", "10",
+             "-preset", "veryslow",
+             "-profile:v", "high", "-level:v", "4.2",
+             "-tune", "animation",
+             "-movflags", "+faststart",
+             mp4_path],
 
+            # Попытка 3: Хорошее качество (CRF 15) — быстрее
             ["ffmpeg", "-y", "-framerate", str(fps),
-             "-i", os.path.join(frames_dir, "frame_%05d.png"),
+             "-i", frames_input,
+             "-vf", vf_filter,
              "-c:v", "libx264", "-pix_fmt", "yuv420p",
-             "-crf", "8", mp4_path],
+             "-crf", "15",
+             "-preset", "medium",
+             "-profile:v", "high", "-level:v", "4.2",
+             "-tune", "animation",
+             "-movflags", "+faststart",
+             mp4_path],
+
+            # Попытка 4: Fallback без масштабирования (если scale не работает)
+            ["ffmpeg", "-y", "-framerate", str(fps),
+             "-i", frames_input,
+             "-c:v", "libx264", "-pix_fmt", "yuv420p",
+             "-crf", "10",
+             "-preset", "medium",
+             "-movflags", "+faststart",
+             mp4_path],
         ]
 
         for attempt, cmd in enumerate(cmds, 1):
             r = subprocess.run(cmd, capture_output=True, timeout=600)
             if r.returncode == 0 and os.path.exists(mp4_path) and os.path.getsize(mp4_path) > 0:
-                logger.info("tgs_to_mp4: ffmpeg попытка %d OK", attempt)
+                size_kb = os.path.getsize(mp4_path) // 1024
+                logger.info("tgs_to_mp4: ffmpeg попытка %d OK | %dKB", attempt, size_kb)
                 break
-            logger.warning("tgs_to_mp4: ffmpeg попытка %d: %s",
-                           attempt, r.stderr.decode(errors="replace")[-150:])
+            logger.warning("tgs_to_mp4: ffmpeg попытка %d failed: %s",
+                           attempt, r.stderr.decode(errors="replace")[-200:])
         else:
             return None
 
         with open(mp4_path, "rb") as f:
             mp4_data = f.read()
 
-        logger.info("tgs_to_mp4 OK: %d кадров, %.1fFPS, %dpx, %d байт",
-                    frame_count, fps, actual_size, len(mp4_data))
+        logger.info("tgs_to_mp4 OK: %d кадров, %.1fFPS, render=%dpx→%dpx, %d байт",
+                    frame_count, fps, actual_render_size, TARGET_SIZE, len(mp4_data))
         return mp4_data
 
     except subprocess.TimeoutExpired:
@@ -1406,28 +1470,30 @@ def make_keyboard_video(slug: str, expire_ts: int = 0) -> InlineKeyboardMarkup:
 
 def get_group_instruction() -> str:
     return (
-        "📖 <b>Инструкция NFT Preview Bot</b>\n"
+        f'<tg-emoji emoji-id="{E_START}">✨</tg-emoji> <b>NFT Preview Bot</b>\n'
         "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
         "<b>Форматы запросов:</b>\n\n"
         "🖼 <b>Статичная картинка (с подписью):</b>\n"
-        "<code>превью Plush Pepe 22</code>\n"
-        "<code>превью Plush Pepe #22</code>\n"
-        "<code>превью Plush Pepe №22</code>\n"
-        "<code>превью t.me/nft/PlushPepe-22</code>\n\n"
+        f'<tg-emoji emoji-id="{E_FORMAT}">▪️</tg-emoji> <code>превью Plush Pepe 22</code>\n'
+        f'<tg-emoji emoji-id="{E_FORMAT}">▪️</tg-emoji> <code>превью Plush Pepe #22</code>\n'
+        f'<tg-emoji emoji-id="{E_FORMAT}">▪️</tg-emoji> <code>превью Plush Pepe №22</code>\n'
+        f'<tg-emoji emoji-id="{E_FORMAT}">▪️</tg-emoji> <code>превью t.me/nft/PlushPepe-22</code>\n\n'
         "🎬 <b>Анимация MP4 (с подписью):</b>\n"
-        "<code>+а превью Plush Pepe 22</code>\n"
-        "<code>+а превью t.me/nft/PlushPepe-22</code>\n\n"
+        f'<tg-emoji emoji-id="{E_FORMAT}">▪️</tg-emoji> <code>+а превью Plush Pepe 22</code>\n'
+        f'<tg-emoji emoji-id="{E_FORMAT}">▪️</tg-emoji> <code>+а превью t.me/nft/PlushPepe-22</code>\n\n'
         "🎞 <b>Только GIF — без подписи и кнопок:</b>\n"
-        "<code>+гиф превью Plush Pepe 22</code>\n"
-        "<code>+гиф превью t.me/nft/PlushPepe-22</code>\n\n"
+        f'<tg-emoji emoji-id="{E_FORMAT}">▪️</tg-emoji> <code>+гиф превью Plush Pepe 22</code>\n'
+        f'<tg-emoji emoji-id="{E_FORMAT}">▪️</tg-emoji> <code>+гиф превью t.me/nft/PlushPepe-22</code>\n\n'
         "🎭 <b>Скачать TGS файл (для импорта стикера):</b>\n"
-        "<code>+тгс превью Plush Pepe 22</code>\n"
-        "<code>+тгс превью t.me/nft/PlushPepe-22</code>\n\n"
-        "<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
-        "<b>📋 Правила:</b>\n"
-        "• Один подарок — не чаще <b>1 раза в 5 минут</b>\n"
-        "• Кнопки под превью — только 1 раз каждая\n"
-        "• <code>превью инструкция</code> — не чаще 1 раза в 5 минут\n\n"
+        f'<tg-emoji emoji-id="{E_FORMAT}">▪️</tg-emoji> <code>+тгс превью Plush Pepe 22</code>\n'
+        f'<tg-emoji emoji-id="{E_FORMAT}">▪️</tg-emoji> <code>+тгс превью t.me/nft/PlushPepe-22</code>\n\n'
+        "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
+        f'<tg-emoji emoji-id="{E_RULES}">📋</tg-emoji> <b>Правила пользования:</b>\n\n'
+        f'<tg-emoji emoji-id="{E_RULE_TIME}">⏱</tg-emoji> <b>Повторный показ</b> одного подарка — не чаще <b>1 раза в 2 минуты</b>\n'
+        f'<tg-emoji emoji-id="{E_RULE_SPAM}">🚫</tg-emoji> <b>Не спамить</b> в личке бота или в чате\n'
+        f'<tg-emoji emoji-id="{E_RULE_TIME}">👥</tg-emoji> <b>В чате</b> — не более <b>5 генераций</b> одновременно, после 5 остальные превью будут отправляться в очередь и это может занять какое-то время\n'
+        f'<tg-emoji emoji-id="{E_RULE_GEN}">⚡</tg-emoji> <b>Время генерации:</b> Видео ~10–25 сек | Картинка ~5–10 сек\n\n'
+        "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
         "<b>❓ Нужна помощь?</b>\n"
         "Пиши автору: @balfikovich"
     )
