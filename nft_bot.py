@@ -1043,14 +1043,14 @@ def _get_lottie_native_size(tgs_path: str) -> tuple[int, int]:
 
 def tgs_to_mp4(tgs_bytes: bytes) -> Optional[bytes]:
     """
-    Конвертирует TGS → MP4 максимального качества.
+    Конвертирует TGS → MP4 высокого качества.
 
-    Стратегия качества:
-    1. rlottie рендерит в 2× нативного размера (вектор масштабируется без потерь)
-    2. Сохраняем кадры как PNG без сжатия (lossless)
-    3. ffmpeg: масштаб 1080×1080 через lanczos + unsharp для резкости
-       CRF 0 (lossless h264) → fallback CRF 10 veryslow → fallback CRF 15 medium
-    4. profile high, level 4.2, movflags faststart для совместимости
+    Стратегия:
+    - rlottie рендерит в нативный размер (512×512 для большинства TGS)
+    - Кадры сохраняются как PNG без сжатия (lossless)
+    - ffmpeg масштабирует до 800×800 через lanczos + чёткость unsharp
+    - CRF 18 medium — оптимальный баланс качество/скорость
+    - Fallback на CRF 23 если что-то пошло не так
     """
     try:
         from rlottie_python import LottieAnimation
@@ -1059,8 +1059,9 @@ def tgs_to_mp4(tgs_bytes: bytes) -> Optional[bytes]:
         logger.error("tgs_to_mp4: не хватает библиотеки: %s", e)
         return None
 
-    # Целевой размер финального видео — 1080p (максимум для Telegram)
-    TARGET_SIZE = 1080
+    # 800px — оптимальный размер: заметно лучше 512, не перегружает сервер
+    # Telegram сам сожмёт выше 720p при воспроизведении, поэтому 800 — потолок
+    TARGET_SIZE = 800
 
     tmp_dir    = tempfile.mkdtemp(prefix="nft_mp4_")
     tgs_path   = os.path.join(tmp_dir, "anim.tgs")
@@ -1075,28 +1076,18 @@ def tgs_to_mp4(tgs_bytes: bytes) -> Optional[bytes]:
         native_size = max(native_w, native_h)
         logger.info("tgs_to_mp4: нативный размер TGS = %dx%d", native_w, native_h)
 
-        # Рендерим в 2× нативного размера — rlottie использует векторный движок,
-        # поэтому рендер в бо́льший размер даёт кристально чистые края и детали.
-        # Апскейл на уровне вектора несравнимо лучше, чем растровый после.
-        render_size = native_size * 2
-        # Ограничиваем 2048 (выше не нужно — Telegram всё равно сожмёт выше 1080)
-        render_size = min(render_size, 2048)
-        render_size = max(render_size, 512)  # минимум 512
-
+        # Рендерим строго в нативный размер — это гарантированно работает
+        # Апскейл до TARGET_SIZE делает ffmpeg (lanczos) — быстро и качественно
         anim = None
-        actual_render_size = render_size
-        for try_size in [render_size, native_size, 1024, 512, 0]:
+        actual_render_size = native_size
+        for try_size in [native_size, 512]:
             try:
-                if try_size > 0:
-                    a = LottieAnimation.from_tgs(tgs_path, width=try_size, height=try_size)
-                else:
-                    a = LottieAnimation.from_tgs(tgs_path)
+                a = LottieAnimation.from_tgs(tgs_path, width=try_size, height=try_size)
                 f0 = a.render_pillow_frame(frame_num=0)
                 if f0 is not None:
                     anim = a
-                    actual_render_size = f0.size[0] if try_size == 0 else try_size
-                    logger.info("tgs_to_mp4: рендер %dx%d (size=%d)",
-                                f0.size[0], f0.size[1], try_size)
+                    actual_render_size = try_size
+                    logger.info("tgs_to_mp4: рендер %dx%d OK", try_size, try_size)
                     break
             except Exception as e:
                 logger.debug("tgs_to_mp4 from_tgs(size=%d) failed: %s", try_size, e)
@@ -1115,17 +1106,20 @@ def tgs_to_mp4(tgs_bytes: bytes) -> Optional[bytes]:
 
         fps = max(fps, 1)
         os.makedirs(frames_dir, exist_ok=True)
-        saved = 0
 
+        # Рендерим все кадры подряд без пропусков — строгая нумерация 00000..N
+        saved = 0
         for i in range(frame_count):
             try:
                 frame_img = anim.render_pillow_frame(frame_num=i)
             except Exception:
-                continue
-            if frame_img is None:
-                continue
+                frame_img = None
 
-            # Приводим к квадрату (центрируем на чёрном фоне)
+            if frame_img is None:
+                # Вставляем пустой чёрный кадр чтобы не ломать нумерацию
+                frame_img = Image.new("RGB", (actual_render_size, actual_render_size), (0, 0, 0))
+
+            # Приводим к квадрату
             w, h = frame_img.size
             if w != h:
                 side = max(w, h)
@@ -1142,7 +1136,6 @@ def tgs_to_mp4(tgs_bytes: bytes) -> Optional[bytes]:
             elif frame_img.mode != "RGB":
                 frame_img = frame_img.convert("RGB")
 
-            # PNG без сжатия = lossless исходники для ffmpeg
             frame_img.save(
                 os.path.join(frames_dir, f"frame_{i:05d}.png"),
                 format="PNG", compress_level=0,
@@ -1153,84 +1146,66 @@ def tgs_to_mp4(tgs_bytes: bytes) -> Optional[bytes]:
             logger.error("tgs_to_mp4: ни один кадр не сохранён")
             return None
 
-        logger.info("tgs_to_mp4: сохранено %d/%d кадров, render=%dpx → target=%dpx",
-                    saved, frame_count, actual_render_size, TARGET_SIZE)
+        logger.info("tgs_to_mp4: сохранено %d кадров, render=%dpx → %dpx",
+                    saved, actual_render_size, TARGET_SIZE)
 
         frames_input = os.path.join(frames_dir, "frame_%05d.png")
 
-        # Фильтр масштабирования + резкость (unsharp усиливает детали после lanczos)
-        # scale до 1080 через lanczos — лучший алгоритм для апскейла
-        # unsharp: luma_msize_x:luma_msize_y:luma_amount:chroma_msize_x:chroma_msize_y:chroma_amount
+        # scale до TARGET_SIZE через lanczos + лёгкий unsharp для резкости
         vf_filter = (
             f"scale={TARGET_SIZE}:{TARGET_SIZE}:flags=lanczos,"
-            "unsharp=5:5:0.6:5:5:0.3"
+            "unsharp=3:3:0.5:3:3:0.0"
         )
 
         cmds = [
-            # Попытка 1: Lossless (CRF 0) — максимальное качество, большой файл
-            # Но Telegram при отправке всё равно перекодирует видео > 50MB,
-            # поэтому реально лучший баланс — CRF 10 veryslow
-            ["ffmpeg", "-y", "-framerate", str(fps),
+            # Основная: CRF 18 medium — хорошее качество, быстрая конвертация (~5-10 сек)
+            ["ffmpeg", "-y",
+             "-framerate", str(fps),
              "-i", frames_input,
              "-vf", vf_filter,
              "-c:v", "libx264", "-pix_fmt", "yuv420p",
-             "-crf", "0",
-             "-preset", "veryslow",
-             "-profile:v", "high", "-level:v", "4.2",
-             "-tune", "animation",
-             "-movflags", "+faststart",
-             mp4_path],
-
-            # Попытка 2: Почти lossless (CRF 10) — отличное качество, разумный размер
-            ["ffmpeg", "-y", "-framerate", str(fps),
-             "-i", frames_input,
-             "-vf", vf_filter,
-             "-c:v", "libx264", "-pix_fmt", "yuv420p",
-             "-crf", "10",
-             "-preset", "veryslow",
-             "-profile:v", "high", "-level:v", "4.2",
-             "-tune", "animation",
-             "-movflags", "+faststart",
-             mp4_path],
-
-            # Попытка 3: Хорошее качество (CRF 15) — быстрее
-            ["ffmpeg", "-y", "-framerate", str(fps),
-             "-i", frames_input,
-             "-vf", vf_filter,
-             "-c:v", "libx264", "-pix_fmt", "yuv420p",
-             "-crf", "15",
+             "-crf", "18",
              "-preset", "medium",
-             "-profile:v", "high", "-level:v", "4.2",
+             "-profile:v", "high", "-level:v", "4.1",
              "-tune", "animation",
              "-movflags", "+faststart",
              mp4_path],
 
-            # Попытка 4: Fallback без масштабирования (если scale не работает)
-            ["ffmpeg", "-y", "-framerate", str(fps),
+            # Fallback: без scale-фильтра (если vf сломался)
+            ["ffmpeg", "-y",
+             "-framerate", str(fps),
              "-i", frames_input,
              "-c:v", "libx264", "-pix_fmt", "yuv420p",
-             "-crf", "10",
+             "-crf", "18",
              "-preset", "medium",
+             "-profile:v", "high", "-level:v", "4.1",
              "-movflags", "+faststart",
+             mp4_path],
+
+            # Последний резерв: минимальные параметры
+            ["ffmpeg", "-y",
+             "-framerate", str(fps),
+             "-i", frames_input,
+             "-c:v", "libx264", "-pix_fmt", "yuv420p",
+             "-crf", "23",
              mp4_path],
         ]
 
         for attempt, cmd in enumerate(cmds, 1):
-            r = subprocess.run(cmd, capture_output=True, timeout=600)
+            r = subprocess.run(cmd, capture_output=True, timeout=300)
             if r.returncode == 0 and os.path.exists(mp4_path) and os.path.getsize(mp4_path) > 0:
                 size_kb = os.path.getsize(mp4_path) // 1024
-                logger.info("tgs_to_mp4: ffmpeg попытка %d OK | %dKB", attempt, size_kb)
+                logger.info("tgs_to_mp4: OK попытка %d | %d кадров | %.1f fps | %dpx | %dKB",
+                            attempt, frame_count, fps, TARGET_SIZE, size_kb)
                 break
-            logger.warning("tgs_to_mp4: ffmpeg попытка %d failed: %s",
-                           attempt, r.stderr.decode(errors="replace")[-200:])
+            err_tail = r.stderr.decode(errors="replace")[-300:]
+            logger.warning("tgs_to_mp4: попытка %d failed: %s", attempt, err_tail)
         else:
             return None
 
         with open(mp4_path, "rb") as f:
             mp4_data = f.read()
 
-        logger.info("tgs_to_mp4 OK: %d кадров, %.1fFPS, render=%dpx→%dpx, %d байт",
-                    frame_count, fps, actual_render_size, TARGET_SIZE, len(mp4_data))
         return mp4_data
 
     except subprocess.TimeoutExpired:
@@ -1244,8 +1219,6 @@ def tgs_to_mp4(tgs_bytes: bytes) -> Optional[bytes]:
             shutil.rmtree(tmp_dir, ignore_errors=True)
         except Exception:
             pass
-
-
 def tgs_to_gif(tgs_bytes: bytes, size: int = 800) -> Optional[bytes]:
     try:
         from rlottie_python import LottieAnimation
